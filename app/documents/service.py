@@ -27,6 +27,8 @@ from app.indexing.schemas import (
     IndexingResult,
     IndexingStatus,
 )
+from app.indexing.vectorstores.memory import MemoryVectorStore
+from app.indexing.vectorstores.qdrant import QdrantHybridVectorStore, QdrantVectorStore
 from app.ingestion.pipeline import LocalParsingPipeline
 
 
@@ -193,7 +195,12 @@ class DocumentService:
             collection_chunks = _combine_chunks(records)
             collection_index = _combine_indexes(
                 records,
-                embedding_dimension=self.settings.ingestion_embedding_dimension,
+                fallback_backend=IndexBackend(self.settings.documents_backend),
+                fallback_embedding_model=self._configured_embedding_model(),
+                fallback_embedding_dimension=self._configured_embedding_dimension(),
+                dense_vector_name=self.settings.dense_vector_name,
+                sparse_vector_name=self.settings.sparse_vector_name,
+                sparse_top_n=self.settings.sparse_top_n,
             )
             chunks_path = self.settings.documents_collection_chunks_path
             index_path = self.settings.documents_collection_index_path
@@ -249,26 +256,47 @@ class DocumentService:
         chunking_result: ChunkingResult,
     ) -> tuple[IndexingResult, Path]:
         embedding_provider = self._build_embedding_provider()
-        indexer = EnterpriseIndexer(
-            config=IndexingConfig(
-                backend=IndexBackend.MEMORY,
-                embedding_model=embedding_provider.model_name,
+        vector_store = None
+        try:
+            backend = IndexBackend(self.settings.documents_backend)
+            if (
+                backend == IndexBackend.QDRANT_HYBRID
+                and self.settings.documents_embedding_provider != "bge-m3"
+            ):
+                raise ValueError(
+                    "Document qdrant_hybrid indexing requires "
+                    "RAG_DOCUMENTS_EMBEDDING_PROVIDER=bge-m3."
+                )
+            vector_store = self._build_vector_store(
+                backend=backend,
                 embedding_dimension=embedding_provider.dimension,
-                embedding_batch_size=self.settings.documents_embedding_batch_size,
-                force_reindex=True,
-            ),
-            embedding_provider=embedding_provider,
-        )
-        indexing_result = indexer.index(chunking_result)
-        _enrich_index_records(indexing_result, record)
-        index_dir = self._document_dir(record.document_id) / "index"
-        index_dir.mkdir(parents=True, exist_ok=True)
-        index_path = index_dir / f"{Path(record.filename).stem}.index.json"
-        index_path.write_text(indexing_result.to_json(), encoding="utf-8")
-        close = getattr(embedding_provider, "close", None)
-        if callable(close):
-            close()
-        return indexing_result, index_path
+            )
+            indexer = EnterpriseIndexer(
+                config=IndexingConfig(
+                    backend=backend,
+                    embedding_model=embedding_provider.model_name,
+                    embedding_dimension=embedding_provider.dimension,
+                    embedding_batch_size=self.settings.documents_embedding_batch_size,
+                    dense_vector_name=self.settings.dense_vector_name,
+                    sparse_vector_name=self.settings.sparse_vector_name,
+                    sparse_top_n=self.settings.sparse_top_n,
+                    force_reindex=True,
+                ),
+                embedding_provider=embedding_provider,
+                vector_store=vector_store,
+            )
+            indexing_result = indexer.index(chunking_result)
+            _enrich_index_records(indexing_result, record)
+            index_dir = self._document_dir(record.document_id) / "index"
+            index_dir.mkdir(parents=True, exist_ok=True)
+            index_path = index_dir / f"{Path(record.filename).stem}.index.json"
+            index_path.write_text(indexing_result.to_json(), encoding="utf-8")
+            return indexing_result, index_path
+        finally:
+            for resource in (vector_store, embedding_provider):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    close()
 
     def _build_embedding_provider(self) -> object:
         if self.settings.documents_embedding_provider == "bge-m3":
@@ -285,6 +313,53 @@ class DocumentService:
                 sparse_top_n=self.settings.sparse_top_n,
             )
         return HashingEmbeddingProvider(self.settings.ingestion_embedding_dimension)
+
+    def _build_vector_store(
+        self,
+        *,
+        backend: IndexBackend,
+        embedding_dimension: int,
+    ) -> object:
+        if backend == IndexBackend.MEMORY:
+            return MemoryVectorStore()
+        if backend == IndexBackend.QDRANT:
+            return QdrantVectorStore(
+                url=self.settings.qdrant_url,
+                path=self._qdrant_path("qdrant"),
+                api_key=self.settings.qdrant_api_key,
+                collection_name=self.settings.qdrant_collection,
+                vector_size=embedding_dimension,
+                timeout=self.settings.qdrant_timeout,
+            )
+        if backend == IndexBackend.QDRANT_HYBRID:
+            return QdrantHybridVectorStore(
+                url=self.settings.qdrant_url,
+                path=self._qdrant_path("qdrant_hybrid"),
+                api_key=self.settings.qdrant_api_key,
+                collection_name=self.settings.qdrant_collection,
+                vector_size=embedding_dimension,
+                dense_vector_name=self.settings.dense_vector_name,
+                sparse_vector_name=self.settings.sparse_vector_name,
+                timeout=self.settings.qdrant_timeout,
+            )
+        raise ValueError(f"Unsupported document indexing backend: {backend}")
+
+    def _qdrant_path(self, default_folder: str) -> Path | None:
+        if self.settings.qdrant_url is not None:
+            return None
+        if self.settings.qdrant_path is not None:
+            return self.settings.qdrant_path
+        return self.settings.documents_collection_index_path.parent / default_folder
+
+    def _configured_embedding_model(self) -> str:
+        if self.settings.documents_embedding_provider == "bge-m3":
+            return self.settings.bge_model or "BAAI/bge-m3"
+        return "hashing-embedding"
+
+    def _configured_embedding_dimension(self) -> int:
+        if self.settings.documents_embedding_provider == "bge-m3":
+            return BGEM3EmbeddingProvider.dimension
+        return self.settings.ingestion_embedding_dimension
 
     def _rewrite_access(self, record: DocumentRecord) -> None:
         if not record.chunks_path or not record.index_path:
@@ -345,7 +420,12 @@ def _combine_chunks(records: list[DocumentRecord]) -> ChunkingResult:
 def _combine_indexes(
     records: list[DocumentRecord],
     *,
-    embedding_dimension: int,
+    fallback_backend: IndexBackend,
+    fallback_embedding_model: str,
+    fallback_embedding_dimension: int,
+    dense_vector_name: str,
+    sparse_vector_name: str,
+    sparse_top_n: int | None,
 ) -> IndexingResult:
     results = [
         IndexingResult.model_validate_json(Path(record.index_path).read_text(encoding="utf-8"))
@@ -353,7 +433,14 @@ def _combine_indexes(
         if record.index_path
     ]
     if not results:
-        return _empty_indexing_result(embedding_dimension=embedding_dimension)
+        return _empty_indexing_result(
+            backend=fallback_backend,
+            embedding_model=fallback_embedding_model,
+            embedding_dimension=fallback_embedding_dimension,
+            dense_vector_name=dense_vector_name,
+            sparse_vector_name=sparse_vector_name,
+            sparse_top_n=sparse_top_n,
+        )
 
     first = results[0]
     for result in results[1:]:
@@ -363,6 +450,10 @@ def _combine_indexes(
             raise ValueError("Cannot combine indexes with different embedding dimensions.")
         if result.manifest.index_version != first.manifest.index_version:
             raise ValueError("Cannot combine indexes with different index versions.")
+        if result.manifest.backend != first.manifest.backend:
+            raise ValueError("Cannot combine indexes with different backends.")
+        if not _manifest_vector_config_matches(first.manifest, result.manifest):
+            raise ValueError("Cannot combine indexes with different vector configurations.")
 
     records_flat = [record for result in results for record in result.records]
     manifest = IndexManifest(
@@ -376,13 +467,16 @@ def _combine_indexes(
         embedding_model=first.manifest.embedding_model,
         embedding_dimension=first.manifest.embedding_dimension,
         index_version=first.manifest.index_version,
-        backend=IndexBackend.MEMORY,
+        backend=first.manifest.backend,
         status=IndexingStatus.INDEXED,
         metadata={
             "combined": True,
             "document_count": len(results),
             "record_count": len(records_flat),
             "source_document_ids": [result.document_id for result in results],
+            "dense_vector_name": first.manifest.metadata.get("dense_vector_name"),
+            "sparse_vector_name": first.manifest.metadata.get("sparse_vector_name"),
+            "sparse_top_n": first.manifest.metadata.get("sparse_top_n"),
         },
     )
     return IndexingResult(
@@ -396,21 +490,32 @@ def _combine_indexes(
     )
 
 
-def _empty_indexing_result(*, embedding_dimension: int) -> IndexingResult:
+def _empty_indexing_result(
+    *,
+    backend: IndexBackend,
+    embedding_model: str,
+    embedding_dimension: int,
+    dense_vector_name: str,
+    sparse_vector_name: str,
+    sparse_top_n: int | None,
+) -> IndexingResult:
     manifest = IndexManifest(
         document_id="default",
         source_uri=None,
         document_hash=_hash_values(["empty"]),
         chunk_hashes={},
-        embedding_model="hashing-embedding",
+        embedding_model=embedding_model,
         embedding_dimension=embedding_dimension,
         index_version="idx-v1",
-        backend=IndexBackend.MEMORY,
+        backend=backend,
         status=IndexingStatus.INDEXED,
         metadata={
             "combined": True,
             "document_count": 0,
             "record_count": 0,
+            "dense_vector_name": dense_vector_name,
+            "sparse_vector_name": sparse_vector_name,
+            "sparse_top_n": sparse_top_n,
         },
     )
     return IndexingResult(
@@ -419,6 +524,20 @@ def _empty_indexing_result(*, embedding_dimension: int) -> IndexingResult:
         indexed_count=0,
         manifest=manifest,
         records=[],
+    )
+
+
+def _manifest_vector_config_matches(
+    left: IndexManifest,
+    right: IndexManifest,
+) -> bool:
+    if left.backend != IndexBackend.QDRANT_HYBRID:
+        return True
+    return (
+        left.metadata.get("dense_vector_name") == right.metadata.get("dense_vector_name")
+        and left.metadata.get("sparse_vector_name")
+        == right.metadata.get("sparse_vector_name")
+        and left.metadata.get("sparse_top_n") == right.metadata.get("sparse_top_n")
     )
 
 

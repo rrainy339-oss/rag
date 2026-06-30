@@ -32,6 +32,20 @@ const els = {
   settingsPanel: document.querySelector("#settings-panel"),
   toggleSettings: document.querySelector("#toggle-settings"),
   closeSettings: document.querySelector("#close-settings"),
+  documentsPanel: document.querySelector("#documents-panel"),
+  toggleDocuments: document.querySelector("#toggle-documents"),
+  closeDocuments: document.querySelector("#close-documents"),
+  refreshDocuments: document.querySelector("#refresh-documents"),
+  documentForm: document.querySelector("#document-form"),
+  documentFile: document.querySelector("#document-file"),
+  documentTitle: document.querySelector("#document-title"),
+  documentTenant: document.querySelector("#document-tenant"),
+  documentOwner: document.querySelector("#document-owner"),
+  documentGroups: document.querySelector("#document-groups"),
+  documentPrincipals: document.querySelector("#document-principals"),
+  documentClassification: document.querySelector("#document-classification"),
+  documentList: document.querySelector("#document-list"),
+  documentsStatus: document.querySelector("#documents-status"),
   toggleSidebar: document.querySelector("#toggle-sidebar"),
   sidebar: document.querySelector(".sidebar"),
   backdrop: document.querySelector("#backdrop"),
@@ -52,8 +66,11 @@ const els = {
 
 const state = {
   sessions: loadSessions(),
+  documents: [],
   activeId: null,
   pending: false,
+  documentsLoaded: false,
+  documentsPending: false,
 };
 
 init();
@@ -82,6 +99,13 @@ function bindEvents() {
   els.sessionSearch.addEventListener("input", renderSessions);
   els.toggleSettings.addEventListener("click", () => openSettings());
   els.closeSettings.addEventListener("click", () => closeSettings());
+  els.toggleDocuments.addEventListener("click", () => openDocuments());
+  els.closeDocuments.addEventListener("click", () => closeDocuments());
+  els.refreshDocuments.addEventListener("click", () => loadDocuments());
+  els.documentForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    uploadDocument();
+  });
   els.toggleSidebar.addEventListener("click", () => openSidebar());
   els.backdrop.addEventListener("click", () => closePanels());
   els.showCitations.addEventListener("change", renderMessages);
@@ -368,6 +392,214 @@ async function refreshModels() {
   }
 }
 
+async function loadDocuments() {
+  setDocumentsStatus("Loading documents...");
+  els.refreshDocuments.disabled = true;
+  try {
+    const response = await fetch(apiEndpoint("documents"));
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = await response.json();
+    state.documents = Array.isArray(data.documents) ? data.documents : [];
+    state.documentsLoaded = true;
+    renderDocuments();
+    setDocumentsStatus(state.documents.length ? "" : "No documents yet.");
+  } catch (error) {
+    setDocumentsStatus(`Load failed: ${error.message}`);
+  } finally {
+    els.refreshDocuments.disabled = false;
+  }
+}
+
+async function uploadDocument() {
+  const file = els.documentFile.files?.[0];
+  if (!file || state.documentsPending) return;
+
+  state.documentsPending = true;
+  els.documentForm.classList.add("is-pending");
+  els.documentForm.querySelector("button[type='submit']").disabled = true;
+  setDocumentsStatus("Uploading. Backend will parse, chunk, embed with BGE-M3, and write dense+sparse vectors to Qdrant.");
+
+  const formData = new FormData();
+  formData.append("file", file);
+  appendFormValue(formData, "title", els.documentTitle.value);
+  appendFormValue(formData, "tenant_id", els.documentTenant.value);
+  appendFormValue(formData, "owner_id", els.documentOwner.value);
+  appendFormValue(formData, "group_ids", els.documentGroups.value);
+  appendFormValue(formData, "principal_ids", els.documentPrincipals.value);
+  appendFormValue(formData, "classification", els.documentClassification.value);
+
+  try {
+    const response = await fetch(apiEndpoint("documents"), {
+      method: "POST",
+      body: formData,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const documentRecord = await response.json();
+    upsertDocument(documentRecord);
+    els.documentForm.reset();
+    setDocumentsStatus("Upload accepted. Indexing is running in the background.");
+    renderDocuments();
+    scheduleDocumentRefresh();
+  } catch (error) {
+    setDocumentsStatus(`Upload failed: ${error.message}`);
+  } finally {
+    state.documentsPending = false;
+    els.documentForm.classList.remove("is-pending");
+    els.documentForm.querySelector("button[type='submit']").disabled = false;
+  }
+}
+
+async function reindexDocument(documentId) {
+  setDocumentsStatus("Reindexing document...");
+  try {
+    const response = await fetch(documentActionUrl(documentId, "reindex"), {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    upsertDocument(await response.json());
+    renderDocuments();
+    scheduleDocumentRefresh();
+  } catch (error) {
+    setDocumentsStatus(`Reindex failed: ${error.message}`);
+  }
+}
+
+async function deleteDocument(documentId) {
+  setDocumentsStatus("Deleting document...");
+  try {
+    const response = await fetch(documentActionUrl(documentId), {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    state.documents = state.documents.filter((item) => item.document_id !== documentId);
+    renderDocuments();
+    setDocumentsStatus("");
+  } catch (error) {
+    setDocumentsStatus(`Delete failed: ${error.message}`);
+  }
+}
+
+function renderDocuments() {
+  if (!state.documentsLoaded && state.documents.length === 0) {
+    els.documentList.replaceChildren(emptyDocumentState("Open the panel to load documents."));
+    return;
+  }
+  if (state.documents.length === 0) {
+    els.documentList.replaceChildren(emptyDocumentState("No documents uploaded."));
+    return;
+  }
+  els.documentList.replaceChildren(...state.documents.map(renderDocumentCard));
+}
+
+function renderDocumentCard(documentRecord) {
+  const card = document.createElement("article");
+  card.className = "document-card";
+
+  const header = document.createElement("div");
+  header.className = "document-card-head";
+  const title = document.createElement("div");
+  title.className = "document-title";
+  title.textContent = documentRecord.title || documentRecord.filename || "Document";
+  const status = document.createElement("span");
+  status.className = `document-status ${documentRecord.status || "uploaded"}`;
+  status.textContent = documentRecord.status || "uploaded";
+  header.append(title, status);
+
+  const meta = document.createElement("div");
+  meta.className = "document-meta";
+  meta.textContent = [
+    documentRecord.filename,
+    `${documentRecord.chunk_count || 0} chunks`,
+    `${documentRecord.indexed_count || 0} indexed`,
+  ]
+    .filter(Boolean)
+    .join(" / ");
+
+  const permissions = document.createElement("div");
+  permissions.className = "document-permissions";
+  permissionLabels(documentRecord).forEach((label) => {
+    const chip = document.createElement("span");
+    chip.textContent = label;
+    permissions.append(chip);
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "document-actions";
+  const reindex = document.createElement("button");
+  reindex.type = "button";
+  reindex.className = "secondary-button";
+  reindex.textContent = "Reindex";
+  reindex.addEventListener("click", () => reindexDocument(documentRecord.document_id));
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "secondary-button danger";
+  remove.textContent = "Delete";
+  remove.addEventListener("click", () => deleteDocument(documentRecord.document_id));
+  actions.append(reindex, remove);
+
+  card.append(header, meta, permissions, actions);
+  if (documentRecord.error_message) {
+    const error = document.createElement("p");
+    error.className = "document-error";
+    error.textContent = documentRecord.error_message;
+    card.append(error);
+  }
+  return card;
+}
+
+function emptyDocumentState(text) {
+  const item = document.createElement("div");
+  item.className = "document-empty";
+  item.textContent = text;
+  return item;
+}
+
+function permissionLabels(documentRecord) {
+  const labels = [];
+  if (documentRecord.tenant_id) labels.push(`tenant: ${documentRecord.tenant_id}`);
+  if (documentRecord.owner_id) labels.push(`owner: ${documentRecord.owner_id}`);
+  for (const groupId of documentRecord.group_ids || []) labels.push(`group: ${groupId}`);
+  for (const principalId of documentRecord.principal_ids || []) labels.push(`user: ${principalId}`);
+  if (documentRecord.classification) labels.push(`class: ${documentRecord.classification}`);
+  return labels.length ? labels : ["access: unrestricted"];
+}
+
+function appendFormValue(formData, name, value) {
+  const cleaned = String(value || "").trim();
+  if (cleaned) {
+    formData.append(name, cleaned);
+  }
+}
+
+function upsertDocument(documentRecord) {
+  const index = state.documents.findIndex(
+    (item) => item.document_id === documentRecord.document_id,
+  );
+  if (index >= 0) {
+    state.documents.splice(index, 1, documentRecord);
+  } else {
+    state.documents.unshift(documentRecord);
+  }
+  state.documentsLoaded = true;
+}
+
+function scheduleDocumentRefresh() {
+  window.setTimeout(() => loadDocuments(), 1400);
+  window.setTimeout(() => loadDocuments(), 4200);
+}
+
+function setDocumentsStatus(text) {
+  els.documentsStatus.textContent = text;
+}
+
 function renderModelOptions(models) {
   els.modelOptions.replaceChildren(
     ...models.map((model) => {
@@ -379,11 +611,25 @@ function renderModelOptions(models) {
 }
 
 function modelListUrl() {
+  return apiEndpoint("models");
+}
+
+function documentActionUrl(documentId, action) {
+  const url = new URL(apiEndpoint("documents"));
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/${encodeURIComponent(documentId)}`;
+  if (action) {
+    url.pathname += `/${action}`;
+  }
+  return url.toString();
+}
+
+function apiEndpoint(resource) {
   const url = new URL(els.apiUrl.value);
-  if (url.pathname.endsWith("/api/chat")) {
-    url.pathname = url.pathname.slice(0, -"/api/chat".length) + "/api/models";
+  const apiIndex = url.pathname.indexOf("/api/");
+  if (apiIndex >= 0) {
+    url.pathname = `${url.pathname.slice(0, apiIndex)}/api/${resource}`;
   } else {
-    url.pathname = "/api/models";
+    url.pathname = `/api/${resource}`;
   }
   url.search = "";
   return url.toString();
@@ -486,6 +732,7 @@ function resizeInput() {
 }
 
 function openSettings() {
+  els.documentsPanel.classList.remove("open");
   els.settingsPanel.classList.add("open");
   els.backdrop.classList.add("show");
 }
@@ -495,13 +742,30 @@ function closeSettings() {
   els.backdrop.classList.remove("show");
 }
 
+function openDocuments() {
+  els.settingsPanel.classList.remove("open");
+  els.sidebar.classList.remove("open");
+  els.documentsPanel.classList.add("open");
+  els.backdrop.classList.add("show");
+  if (!state.documentsLoaded) {
+    loadDocuments();
+  }
+}
+
+function closeDocuments() {
+  els.documentsPanel.classList.remove("open");
+  els.backdrop.classList.remove("show");
+}
+
 function openSidebar() {
+  els.documentsPanel.classList.remove("open");
   els.sidebar.classList.add("open");
   els.backdrop.classList.add("show");
 }
 
 function closePanels() {
   els.settingsPanel.classList.remove("open");
+  els.documentsPanel.classList.remove("open");
   els.sidebar.classList.remove("open");
   els.backdrop.classList.remove("show");
 }

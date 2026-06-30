@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ class DocumentRegistry:
         self.init_schema()
 
     def init_schema(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
@@ -46,7 +47,7 @@ class DocumentRegistry:
             )
 
     def create(self, record: DocumentRecord) -> DocumentRecord:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO documents (
@@ -68,7 +69,7 @@ class DocumentRegistry:
         return record
 
     def get(self, document_id: str) -> DocumentRecord | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM documents WHERE document_id = ?",
                 (document_id,),
@@ -82,7 +83,7 @@ class DocumentRegistry:
             query += " WHERE status != ?"
             params = (DocumentStatus.DELETED.value,)
         query += " ORDER BY created_at DESC"
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_to_record(row) for row in rows]
 
@@ -155,7 +156,7 @@ class DocumentRegistry:
         values["updated_at"] = datetime.now(timezone.utc).isoformat()
         assignments = ", ".join(f"{key} = :{key}" for key in values)
         params = {**values, "document_id": document_id}
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 f"UPDATE documents SET {assignments} WHERE document_id = :document_id",
                 params,
@@ -166,6 +167,19 @@ class DocumentRegistry:
         if record is None:
             raise KeyError(document_id)
         return record
+
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            connection.close()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)

@@ -410,7 +410,8 @@ def _to_document_response(
     *,
     request_id: str | None = None,
 ) -> DocumentResponse:
-    response = DocumentResponse.model_validate(record)
+    data = record.model_dump() if hasattr(record, "model_dump") else record
+    response = DocumentResponse.model_validate(data)
     response.request_id = request_id
     return response
 

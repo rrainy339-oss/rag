@@ -180,6 +180,11 @@ The first service layer exposes:
 - `POST /api/retrieve`
 - `POST /api/chat`
 - `POST /api/models`
+- `GET /api/documents`
+- `POST /api/documents`
+- `PATCH /api/documents/{document_id}/permissions`
+- `POST /api/documents/{document_id}/reindex`
+- `DELETE /api/documents/{document_id}`
 
 By default, the API runs with the local sample index, in-memory retrieval, and
 a mock LLM provider so it can be tested without external services. Configure
@@ -191,6 +196,26 @@ $env:RAG_API_CHUNKS_PATH="artifacts\chunks\sample.chunks.json"
 $env:RAG_API_BACKEND="memory"
 $env:RAG_API_LLM_PROVIDER="mock"
 ```
+
+Document uploads run parse -> chunk -> index in a background task. The document
+indexing path defaults to BGE-M3 hybrid embeddings and Qdrant hybrid storage, so
+both dense and sparse vectors are written to the configured Qdrant collection:
+
+```powershell
+$env:RAG_DOCUMENTS_BACKEND="qdrant_hybrid"
+$env:RAG_DOCUMENTS_EMBEDDING_PROVIDER="bge-m3"
+$env:RAG_API_BACKEND="qdrant_hybrid"
+$env:RAG_API_EMBEDDING_PROVIDER="bge-m3"
+$env:RAG_API_QDRANT_URL="http://localhost:6333"
+$env:RAG_API_QDRANT_COLLECTION="rag_chunks"
+$env:RAG_API_DENSE_VECTOR_NAME="dense"
+$env:RAG_API_SPARSE_VECTOR_NAME="sparse"
+```
+
+For a local embedded Qdrant store instead of a server, set
+`RAG_API_QDRANT_PATH`, for example `artifacts\collections\default\qdrant_hybrid`,
+and leave `RAG_API_QDRANT_URL` unset. The frontend document panel posts access
+fields with each upload: tenant, owner, groups, user IDs, and classification.
 
 ### Ollama Local LLM
 

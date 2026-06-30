@@ -70,6 +70,59 @@ class FastAPIAppTest(unittest.TestCase):
         self.assertEqual(payload["request_id"], "models-test")
         self.assertEqual(payload["models"], ["llama3.1"])
 
+    def test_document_upload_accepts_permission_fields(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from app.api import main as api_main
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_data = _settings(Path(temp_dir)).model_dump()
+            settings_data.update(
+                {
+                    "documents_db_path": Path(temp_dir) / "documents.sqlite3",
+                    "documents_storage_dir": Path(temp_dir) / "documents",
+                    "documents_collection_index_path": Path(temp_dir)
+                    / "collection"
+                    / "index.json",
+                    "documents_collection_chunks_path": Path(temp_dir)
+                    / "collection"
+                    / "chunks.json",
+                    "documents_backend": "memory",
+                    "documents_embedding_provider": "hashing",
+                }
+            )
+            api_main.settings = api_main.APISettings(**settings_data)
+            api_main.reset_runtime_for_tests()
+            with TestClient(api_main.app) as client:
+                with patch.object(
+                    api_main.DocumentService,
+                    "process_document",
+                    return_value=None,
+                ):
+                    response = client.post(
+                        "/api/documents",
+                        files={"file": ("policy.txt", b"hello", "text/plain")},
+                        data={
+                            "title": "Policy",
+                            "tenant_id": "tenant-a",
+                            "owner_id": "owner-1",
+                            "group_ids": "legal, compliance",
+                            "principal_ids": "user-1, user-2",
+                            "classification": "confidential",
+                        },
+                        headers={"x-request-id": "upload-test"},
+                    )
+            api_main.reset_runtime_for_tests()
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["request_id"], "upload-test")
+        self.assertEqual(payload["tenant_id"], "tenant-a")
+        self.assertEqual(payload["owner_id"], "owner-1")
+        self.assertEqual(payload["group_ids"], ["legal", "compliance"])
+        self.assertEqual(payload["principal_ids"], ["user-1", "user-2"])
+        self.assertEqual(payload["classification"], "confidential")
+
     def test_dev_auth_principal_overrides_request_acl_fields(self) -> None:
         from fastapi.testclient import TestClient
 
