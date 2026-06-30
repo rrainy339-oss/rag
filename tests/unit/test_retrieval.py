@@ -5,19 +5,18 @@ import unittest
 from app.chunking.schemas import Chunk, ChunkType, ChunkingResult
 from app.domain.schemas import AccessControl, CitationSpan
 from app.indexing.config import IndexingConfig
-from app.indexing.embeddings.hashing import HashingEmbeddingProvider
 from app.indexing.indexer import EnterpriseIndexer
 from app.indexing.manifest import InMemoryManifestStore
-from app.indexing.sparse.memory_bm25 import MemoryBM25Store
-from app.indexing.vectorstores.memory import MemoryVectorStore
 from app.retrieval.chunk_store import ChunkStore
 from app.retrieval.config import RetrievalConfig
 from app.retrieval.context_builder import ContextBuilder
-from app.retrieval.dense import DenseRetriever
 from app.retrieval.parent_expander import ParentExpander
-from app.retrieval.pipeline import RetrievalPipeline
+from app.retrieval.qdrant_hybrid import (
+    QdrantHybridRetrievalPipeline,
+    QdrantHybridRetriever,
+)
 from app.retrieval.schemas import QueryType, RetrievalQuery
-from app.retrieval.sparse import SparseRetriever
+from tests.unit.hybrid_fakes import CapturingHybridVectorStore, FakeHybridEmbeddingProvider
 
 
 class RetrievalPipelineTest(unittest.TestCase):
@@ -36,6 +35,7 @@ class RetrievalPipelineTest(unittest.TestCase):
         self.assertTrue(response.contexts)
         self.assertEqual(response.contexts[0].chunk_type, ChunkType.TABLE)
         self.assertIn("Health insurance", response.contexts[0].text)
+        self.assertEqual(response.stats["retriever"], "qdrant_hybrid")
         self.assertEqual(response.stats["reranker"], "noop-reranker")
 
     def test_child_hit_expands_to_parent_context(self) -> None:
@@ -55,7 +55,7 @@ class RetrievalPipelineTest(unittest.TestCase):
         self.assertIn("Remote work is available", response.contexts[0].text)
         self.assertTrue(response.contexts[0].metadata["expanded_from_parent"])
 
-    def test_acl_filters_candidates_before_fusion(self) -> None:
+    def test_acl_filters_candidates_before_context_building(self) -> None:
         pipeline = _build_pipeline(_load_sample_chunks())
 
         denied = pipeline.retrieve(
@@ -78,26 +78,26 @@ class RetrievalPipelineTest(unittest.TestCase):
         self.assertTrue(allowed.contexts)
 
 
-def _build_pipeline(chunking_result: ChunkingResult) -> RetrievalPipeline:
-    embedding_provider = HashingEmbeddingProvider(64)
-    vector_store = MemoryVectorStore()
-    sparse_store = MemoryBM25Store()
+def _build_pipeline(chunking_result: ChunkingResult) -> QdrantHybridRetrievalPipeline:
+    embedding_provider = FakeHybridEmbeddingProvider()
+    vector_store = CapturingHybridVectorStore()
     indexer = EnterpriseIndexer(
-        config=IndexingConfig(embedding_dimension=64),
         embedding_provider=embedding_provider,
         vector_store=vector_store,
-        sparse_store=sparse_store,
+        config=IndexingConfig(
+            embedding_model=embedding_provider.model_name,
+            embedding_dimension=embedding_provider.dimension,
+        ),
         manifest_store=InMemoryManifestStore(),
     )
     indexer.index(chunking_result)
 
     chunk_store = ChunkStore.from_chunking_result(chunking_result)
-    return RetrievalPipeline(
-        dense_retriever=DenseRetriever(
+    return QdrantHybridRetrievalPipeline(
+        hybrid_retriever=QdrantHybridRetriever(
             embedding_provider=embedding_provider,
             vector_store=vector_store,
         ),
-        sparse_retriever=SparseRetriever(sparse_store=sparse_store),
         config=RetrievalConfig(final_top_k=3),
         context_builder=ContextBuilder(ParentExpander(chunk_store)),
     )

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tests.unit.test_api_runtime import _settings
+from tests.unit.test_api_runtime import _settings, runtime_dependency_patches
 
 
 FASTAPI_AVAILABLE = importlib.util.find_spec("fastapi") is not None
@@ -21,22 +21,23 @@ class FastAPIAppTest(unittest.TestCase):
         from app.api import main as api_main
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            api_main.settings = _settings(Path(temp_dir))
+            api_main.settings, indexing_result = _settings(Path(temp_dir))
             api_main.reset_runtime_for_tests()
-            client = TestClient(api_main.app)
-            response = client.post(
-                "/api/chat",
-                json={
-                    "query": "health insurance",
-                    "tenant_id": "tenant-a",
-                    "group_ids": ["hr"],
-                    "top_k": 2,
-                    "model": "mock-model",
-                    "temperature": 0.1,
-                },
-                headers={"x-request-id": "api-test"},
-            )
-            api_main.reset_runtime_for_tests()
+            with runtime_dependency_patches(indexing_result):
+                client = TestClient(api_main.app)
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "query": "health insurance",
+                        "tenant_id": "tenant-a",
+                        "group_ids": ["hr"],
+                        "top_k": 2,
+                        "model": "mock-model",
+                        "temperature": 0.1,
+                    },
+                    headers={"x-request-id": "api-test"},
+                )
+                api_main.reset_runtime_for_tests()
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -76,7 +77,8 @@ class FastAPIAppTest(unittest.TestCase):
         from app.api import main as api_main
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            settings_data = _settings(Path(temp_dir)).model_dump()
+            settings, _ = _settings(Path(temp_dir))
+            settings_data = settings.model_dump()
             settings_data.update(
                 {
                     "documents_db_path": Path(temp_dir) / "documents.sqlite3",
@@ -87,8 +89,6 @@ class FastAPIAppTest(unittest.TestCase):
                     "documents_collection_chunks_path": Path(temp_dir)
                     / "collection"
                     / "chunks.json",
-                    "documents_backend": "memory",
-                    "documents_embedding_provider": "hashing",
                 }
             )
             api_main.settings = api_main.APISettings(**settings_data)
@@ -130,30 +130,31 @@ class FastAPIAppTest(unittest.TestCase):
         from app.security import SecuritySettings
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            api_main.settings = _settings(Path(temp_dir))
+            api_main.settings, indexing_result = _settings(Path(temp_dir))
             api_main.security_settings = SecuritySettings(auth_mode="dev")
             api_main.audit_logger = api_main.AuditLogger.from_settings(
                 api_main.security_settings
             )
             api_main.reset_runtime_for_tests()
-            client = TestClient(api_main.app)
-            response = client.post(
-                "/api/chat",
-                json={
-                    "query": "health insurance",
-                    "tenant_id": "tenant-a",
-                    "group_ids": ["hr"],
-                    "top_k": 2,
-                    "llm_provider": "mock",
-                },
-                headers={
-                    "x-request-id": "dev-auth-test",
-                    "x-rag-tenant-id": "tenant-a",
-                    "x-rag-group-ids": "engineering",
-                    "x-rag-scopes": "rag:chat",
-                },
-            )
-            api_main.reset_runtime_for_tests()
+            with runtime_dependency_patches(indexing_result):
+                client = TestClient(api_main.app)
+                response = client.post(
+                    "/api/chat",
+                    json={
+                        "query": "health insurance",
+                        "tenant_id": "tenant-a",
+                        "group_ids": ["hr"],
+                        "top_k": 2,
+                        "llm_provider": "mock",
+                    },
+                    headers={
+                        "x-request-id": "dev-auth-test",
+                        "x-rag-tenant-id": "tenant-a",
+                        "x-rag-group-ids": "engineering",
+                        "x-rag-scopes": "rag:chat",
+                    },
+                )
+                api_main.reset_runtime_for_tests()
             api_main.security_settings = SecuritySettings(auth_mode="disabled")
             api_main.audit_logger = api_main.AuditLogger.from_settings(
                 api_main.security_settings

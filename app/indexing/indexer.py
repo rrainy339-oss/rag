@@ -8,7 +8,6 @@ from app.chunking.schemas import Chunk, ChunkingResult
 from app.indexing.batching import batched
 from app.indexing.config import IndexingConfig
 from app.indexing.embeddings.base import EmbeddingProvider
-from app.indexing.embeddings.hashing import HashingEmbeddingProvider
 from app.indexing.manifest import InMemoryManifestStore
 from app.indexing.permissions import access_to_payload
 from app.indexing.schemas import (
@@ -18,8 +17,6 @@ from app.indexing.schemas import (
     IndexingResult,
     IndexingStatus,
 )
-from app.indexing.sparse.memory_bm25 import build_sparse_terms
-from app.indexing.vectorstores.memory import MemoryVectorStore
 
 
 class ManifestStore(Protocol):
@@ -34,18 +31,16 @@ class EnterpriseIndexer:
     def __init__(
         self,
         *,
+        embedding_provider: EmbeddingProvider,
+        vector_store: object,
         config: IndexingConfig | None = None,
-        embedding_provider: EmbeddingProvider | None = None,
-        vector_store: object | None = None,
-        sparse_store: object | None = None,
         manifest_store: ManifestStore | None = None,
     ) -> None:
         self.config = config or IndexingConfig()
-        self.embedding_provider = embedding_provider or HashingEmbeddingProvider(
-            self.config.embedding_dimension
-        )
-        self.vector_store = vector_store or MemoryVectorStore()
-        self.sparse_store = sparse_store
+        if self.config.backend != IndexBackend.QDRANT_HYBRID:
+            raise ValueError("EnterpriseIndexer only supports qdrant_hybrid indexing.")
+        self.embedding_provider = embedding_provider
+        self.vector_store = vector_store
         self.manifest_store = manifest_store or InMemoryManifestStore()
 
     def index(self, chunking_result: ChunkingResult) -> IndexingResult:
@@ -123,47 +118,34 @@ class EnterpriseIndexer:
         ]
 
     def _delete_existing(self, document_id: str) -> int:
-        vector_deleted = self.vector_store.delete_by_document(document_id)
-        if self.sparse_store is not None:
-            self.sparse_store.delete_by_document(document_id)
-        return int(vector_deleted or 0)
+        return int(self.vector_store.delete_by_document(document_id) or 0)
 
     def _build_records(self, chunks: list[Chunk]) -> list[IndexRecord]:
         records: list[IndexRecord] = []
         for batch in batched(chunks, self.config.embedding_batch_size):
             texts = [chunk.contextual_text for chunk in batch]
-            if self.config.backend == IndexBackend.QDRANT_HYBRID:
-                embed_hybrid = getattr(self.embedding_provider, "embed_documents_hybrid", None)
-                if not callable(embed_hybrid):
-                    raise ValueError(
-                        "qdrant_hybrid indexing requires an embedding provider with "
-                        "embed_documents_hybrid(). Use --embedding-provider bge-m3."
-                    )
-                embeddings = embed_hybrid(texts)
-                if len(embeddings) != len(batch):
-                    raise ValueError(
-                        "Embedding provider returned a mismatched hybrid vector count."
-                    )
+            embed_hybrid = getattr(self.embedding_provider, "embed_documents_hybrid", None)
+            if not callable(embed_hybrid):
+                raise ValueError(
+                    "qdrant_hybrid indexing requires an embedding provider with "
+                    "embed_documents_hybrid(). Use BGE-M3."
+                )
+            embeddings = embed_hybrid(texts)
+            if len(embeddings) != len(batch):
+                raise ValueError(
+                    "Embedding provider returned a mismatched hybrid vector count."
+                )
 
-                for chunk, embedding in zip(batch, embeddings, strict=True):
-                    self._validate_dense_vector(embedding.dense)
-                    records.append(
-                        self._record_from_chunk(
-                            chunk=chunk,
-                            vector=embedding.dense,
-                            sparse_vector_indices=embedding.sparse.indices,
-                            sparse_vector_values=embedding.sparse.values,
-                        )
+            for chunk, embedding in zip(batch, embeddings, strict=True):
+                self._validate_dense_vector(embedding.dense)
+                records.append(
+                    self._record_from_chunk(
+                        chunk=chunk,
+                        vector=embedding.dense,
+                        sparse_vector_indices=embedding.sparse.indices,
+                        sparse_vector_values=embedding.sparse.values,
                     )
-                continue
-
-            vectors = self.embedding_provider.embed_documents(texts)
-            if len(vectors) != len(batch):
-                raise ValueError("Embedding provider returned a mismatched vector count.")
-
-            for chunk, vector in zip(batch, vectors, strict=True):
-                self._validate_dense_vector(vector)
-                records.append(self._record_from_chunk(chunk=chunk, vector=vector))
+                )
         return records
 
     def _validate_dense_vector(self, vector: list[float]) -> None:
@@ -205,7 +187,7 @@ class EnterpriseIndexer:
             text=chunk.text,
             contextual_text=chunk.contextual_text,
             vector=vector,
-            sparse_terms=build_sparse_terms(chunk.contextual_text),
+            sparse_terms={},
             sparse_vector_indices=list(sparse_vector_indices or []),
             sparse_vector_values=list(sparse_vector_values or []),
             metadata=metadata,
@@ -219,8 +201,6 @@ class EnterpriseIndexer:
 
     def _upsert(self, records: list[IndexRecord]) -> None:
         self.vector_store.upsert(records)
-        if self.sparse_store is not None:
-            self.sparse_store.upsert(records)
 
 
 def _document_hash(chunking_result: ChunkingResult) -> str:
@@ -246,8 +226,6 @@ def _source_uri(chunks: list[Chunk]) -> str | None:
 
 
 def _manifest_config_matches(manifest: IndexManifest, config: IndexingConfig) -> bool:
-    if config.backend != IndexBackend.QDRANT_HYBRID:
-        return True
     return (
         manifest.metadata.get("dense_vector_name") == config.dense_vector_name
         and manifest.metadata.get("sparse_vector_name") == config.sparse_vector_name

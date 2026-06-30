@@ -7,8 +7,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-BackendName = Literal["memory", "qdrant", "qdrant_hybrid"]
-EmbeddingProviderName = Literal["auto", "hashing", "bge-m3"]
+BackendName = Literal["qdrant_hybrid"]
+EmbeddingProviderName = Literal["bge-m3"]
 LLMProviderName = Literal["mock", "ollama", "openai-compatible"]
 RerankerName = Literal["noop", "bge", "qwen", "cohere", "voyage"]
 
@@ -28,13 +28,10 @@ class APISettings(BaseModel):
     documents_child_max_tokens: int = Field(default=650, ge=100)
     documents_parent_target_tokens: int = Field(default=1400, ge=200)
     documents_parent_max_tokens: int = Field(default=2000, ge=300)
-    documents_backend: BackendName = "qdrant_hybrid"
-    documents_embedding_provider: Literal["hashing", "bge-m3"] = "bge-m3"
-    ingestion_embedding_dimension: int = Field(default=384, ge=8)
     documents_embedding_batch_size: int = Field(default=32, ge=1)
 
-    backend: BackendName = "memory"
-    embedding_provider: EmbeddingProviderName = "auto"
+    backend: BackendName = "qdrant_hybrid"
+    embedding_provider: EmbeddingProviderName = "bge-m3"
     bge_model: str | None = None
     bge_cache_dir: Path | None = None
     bge_batch_size: int = Field(default=12, ge=1)
@@ -121,15 +118,9 @@ class APISettings(BaseModel):
             documents_child_max_tokens=_int("RAG_DOCUMENTS_CHILD_MAX_TOKENS", 650),
             documents_parent_target_tokens=_int("RAG_DOCUMENTS_PARENT_TARGET_TOKENS", 1400),
             documents_parent_max_tokens=_int("RAG_DOCUMENTS_PARENT_MAX_TOKENS", 2000),
-            documents_backend=_str("RAG_DOCUMENTS_BACKEND", "qdrant_hybrid"),
-            documents_embedding_provider=_str(
-                "RAG_DOCUMENTS_EMBEDDING_PROVIDER",
-                "bge-m3",
-            ),
-            ingestion_embedding_dimension=_int("RAG_DOCUMENTS_EMBEDDING_DIMENSION", 384),
             documents_embedding_batch_size=_int("RAG_DOCUMENTS_EMBEDDING_BATCH_SIZE", 32),
-            backend=_str("RAG_API_BACKEND", "memory"),
-            embedding_provider=_str("RAG_API_EMBEDDING_PROVIDER", "auto"),
+            backend=_str("RAG_API_BACKEND", "qdrant_hybrid"),
+            embedding_provider=_str("RAG_API_EMBEDDING_PROVIDER", "bge-m3"),
             bge_model=_optional_str("RAG_API_BGE_MODEL"),
             bge_cache_dir=_optional_path("RAG_API_BGE_CACHE_DIR"),
             bge_batch_size=_int("RAG_API_BGE_BATCH_SIZE", 12),

@@ -11,8 +11,6 @@ from app.domain.schemas import AccessControl, CitationSpan
 
 
 class IndexBackend(StrEnum):
-    MEMORY = "memory"
-    QDRANT = "qdrant"
     QDRANT_HYBRID = "qdrant_hybrid"
 
 

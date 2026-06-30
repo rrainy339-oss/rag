@@ -7,8 +7,8 @@ import unittest
 from app.api.settings import APISettings
 from app.documents.schemas import DocumentRecord, DocumentStatus
 from app.documents.service import DocumentService
-from app.indexing.embeddings.base import HybridEmbedding, SparseEmbeddingVector
 from app.indexing.schemas import IndexBackend, IndexingResult
+from tests.unit.hybrid_fakes import CapturingHybridVectorStore, FakeHybridEmbeddingProvider
 from tests.unit.test_retrieval import _load_sample_chunks
 
 
@@ -18,14 +18,13 @@ class DocumentServiceTest(unittest.TestCase):
             root = Path(temp_dir)
             settings = _document_settings(root)
             service = DocumentService(settings)
-            provider = _FakeHybridProvider()
-            vector_store = _CapturingVectorStore()
-            captured: dict[str, object] = {}
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            captured: dict[str, int] = {}
 
             service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
 
-            def build_vector_store(*, backend: IndexBackend, embedding_dimension: int) -> object:
-                captured["backend"] = backend
+            def build_vector_store(*, embedding_dimension: int) -> object:
                 captured["embedding_dimension"] = embedding_dimension
                 return vector_store
 
@@ -36,7 +35,6 @@ class DocumentServiceTest(unittest.TestCase):
             indexing_result, index_path = service._index_document(record, chunking_result)
             index_path_exists = index_path.exists()
 
-        self.assertEqual(captured["backend"], IndexBackend.QDRANT_HYBRID)
         self.assertEqual(captured["embedding_dimension"], provider.dimension)
         self.assertTrue(provider.closed)
         self.assertTrue(vector_store.closed)
@@ -54,9 +52,9 @@ class DocumentServiceTest(unittest.TestCase):
             root = Path(temp_dir)
             settings = _document_settings(root)
             service = DocumentService(settings)
-            service._build_embedding_provider = lambda: _FakeHybridProvider()  # type: ignore[method-assign]
+            service._build_embedding_provider = lambda: FakeHybridEmbeddingProvider()  # type: ignore[method-assign]
             service._build_vector_store = (  # type: ignore[method-assign]
-                lambda *, backend, embedding_dimension: _CapturingVectorStore()
+                lambda *, embedding_dimension: CapturingHybridVectorStore()
             )
 
             record = _record(root)
@@ -86,51 +84,8 @@ class DocumentServiceTest(unittest.TestCase):
         self.assertEqual(collection.indexed_count, indexing_result.indexed_count)
 
 
-class _FakeHybridProvider:
-    model_name = "BAAI/bge-m3-test"
-    dimension = 8
-
-    def __init__(self) -> None:
-        self.closed = False
-
-    def embed_documents_hybrid(self, texts: list[str]) -> list[HybridEmbedding]:
-        return [
-            HybridEmbedding(
-                dense=[1.0, 0.0, 0.0, float(index + 1), 0.0, 0.0, 0.0, 0.0],
-                sparse=SparseEmbeddingVector(indices=[index + 10], values=[0.5]),
-            )
-            for index, _ in enumerate(texts)
-        ]
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _CapturingVectorStore:
-    def __init__(self) -> None:
-        self.records = []
-        self.closed = False
-
-    def delete_by_document(self, document_id: str) -> int:
-        self.records = [
-            record for record in self.records if record.document_id != document_id
-        ]
-        return 0
-
-    def upsert(self, records: list[object]) -> None:
-        self.records.extend(records)
-
-    def count(self) -> int:
-        return len(self.records)
-
-    def close(self) -> None:
-        self.closed = True
-
-
 def _document_settings(root: Path) -> APISettings:
     return APISettings(
-        documents_backend="qdrant_hybrid",
-        documents_embedding_provider="bge-m3",
         documents_db_path=root / "documents.sqlite3",
         documents_storage_dir=root / "documents",
         documents_collection_index_path=root / "collection" / "index.json",

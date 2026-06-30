@@ -29,24 +29,18 @@ from app.api.schemas import (
 from app.api.settings import APISettings
 from app.chunking.schemas import ChunkingResult
 from app.indexing.embeddings.bge import BGEM3EmbeddingProvider
-from app.indexing.embeddings.hashing import HashingEmbeddingProvider
 from app.indexing.schemas import IndexingResult
-from app.indexing.sparse.memory_bm25 import MemoryBM25Store
-from app.indexing.vectorstores.memory import MemoryVectorStore
-from app.indexing.vectorstores.qdrant import QdrantHybridVectorStore, QdrantVectorStore
+from app.indexing.vectorstores.qdrant import QdrantHybridVectorStore
 from app.retrieval.chunk_store import ChunkStore
 from app.retrieval.config import RetrievalConfig
 from app.retrieval.context_builder import ContextBuilder
-from app.retrieval.dense import DenseRetriever
 from app.retrieval.parent_expander import ParentExpander
-from app.retrieval.pipeline import RetrievalPipeline
 from app.retrieval.qdrant_hybrid import (
     QdrantHybridRetrievalPipeline,
     QdrantHybridRetriever,
 )
 from app.retrieval.rerankers import RerankerConfig, RerankerProvider, build_reranker
 from app.retrieval.schemas import RetrievalQuery, RetrievalResponse
-from app.retrieval.sparse import SparseRetriever
 from app.security.schemas import Principal
 
 
@@ -57,7 +51,6 @@ class RAGRuntime:
         self.chunking_result = _load_chunking_result(settings.chunks_path)
         self.embedding_provider = self._build_embedding_provider()
         self.vector_store = self._build_vector_store()
-        self.sparse_store = self._build_sparse_store()
         self.chunk_store = ChunkStore.from_chunking_result(self.chunking_result)
         self.reranker = self._build_reranker()
 
@@ -144,22 +137,11 @@ class RAGRuntime:
             ),
         )
         context_builder = ContextBuilder(ParentExpander(self.chunk_store))
-        if self.settings.backend == "qdrant_hybrid":
-            return QdrantHybridRetrievalPipeline(
-                hybrid_retriever=QdrantHybridRetriever(
-                    embedding_provider=self.embedding_provider,
-                    vector_store=self.vector_store,
-                ),
-                config=config,
-                reranker=self.reranker,
-                context_builder=context_builder,
-            )
-        return RetrievalPipeline(
-            dense_retriever=DenseRetriever(
+        return QdrantHybridRetrievalPipeline(
+            hybrid_retriever=QdrantHybridRetriever(
                 embedding_provider=self.embedding_provider,
                 vector_store=self.vector_store,
             ),
-            sparse_retriever=SparseRetriever(sparse_store=self.sparse_store),
             config=config,
             reranker=self.reranker,
             context_builder=context_builder,
@@ -183,79 +165,41 @@ class RAGRuntime:
         )
 
     def _build_embedding_provider(self) -> object:
-        provider = self.settings.embedding_provider
-        if provider == "auto":
-            model = self.indexing_result.manifest.embedding_model.lower()
-            if self.indexing_result.manifest.embedding_model == "hashing-embedding":
-                provider = "hashing"
-            elif "bge-m3" in model:
-                provider = "bge-m3"
-            else:
-                raise RuntimeConfigurationError(
-                    "Cannot infer embedding provider from index manifest model "
-                    f"{self.indexing_result.manifest.embedding_model!r}."
-                )
-
-        if provider == "hashing":
-            return HashingEmbeddingProvider(
-                self.indexing_result.manifest.embedding_dimension
+        if "bge-m3" not in self.indexing_result.manifest.embedding_model.lower():
+            raise RuntimeConfigurationError(
+                "Runtime requires a BGE-M3 hybrid index manifest, got "
+                f"{self.indexing_result.manifest.embedding_model!r}."
             )
-        if provider == "bge-m3":
-            return BGEM3EmbeddingProvider(
-                model_name=(
-                    self.settings.bge_model
-                    or self.indexing_result.manifest.embedding_model
-                ),
-                use_fp16=self.settings.bge_use_fp16,
-                max_length=self.settings.bge_max_length,
-                batch_size=self.settings.bge_batch_size,
-                cache_dir=(
-                    str(self.settings.bge_cache_dir)
-                    if self.settings.bge_cache_dir
-                    else None
-                ),
-                sparse_top_n=self.settings.sparse_top_n,
-            )
-        raise RuntimeConfigurationError(f"Unsupported embedding provider: {provider}")
+        return BGEM3EmbeddingProvider(
+            model_name=(
+                self.settings.bge_model
+                or self.indexing_result.manifest.embedding_model
+            ),
+            use_fp16=self.settings.bge_use_fp16,
+            max_length=self.settings.bge_max_length,
+            batch_size=self.settings.bge_batch_size,
+            cache_dir=(
+                str(self.settings.bge_cache_dir)
+                if self.settings.bge_cache_dir
+                else None
+            ),
+            sparse_top_n=self.settings.sparse_top_n,
+        )
 
     def _build_vector_store(self) -> object:
-        if self.settings.backend == "memory":
-            store = MemoryVectorStore()
-            store.upsert(self.indexing_result.records)
-            return store
-        if self.settings.backend == "qdrant":
-            qdrant_path = self.settings.qdrant_path
-            if self.settings.qdrant_url is None and qdrant_path is None:
-                qdrant_path = self.settings.index_path.parent / "qdrant"
-            return QdrantVectorStore(
-                url=self.settings.qdrant_url,
-                path=qdrant_path,
-                api_key=self.settings.qdrant_api_key,
-                collection_name=self.settings.qdrant_collection,
-                vector_size=self.indexing_result.manifest.embedding_dimension,
-                timeout=self.settings.qdrant_timeout,
-            )
-        if self.settings.backend == "qdrant_hybrid":
-            qdrant_path = self.settings.qdrant_path
-            if self.settings.qdrant_url is None and qdrant_path is None:
-                qdrant_path = self.settings.index_path.parent / "qdrant_hybrid"
-            return QdrantHybridVectorStore(
-                url=self.settings.qdrant_url,
-                path=qdrant_path,
-                api_key=self.settings.qdrant_api_key,
-                collection_name=self.settings.qdrant_collection,
-                vector_size=self.indexing_result.manifest.embedding_dimension,
-                dense_vector_name=self.settings.dense_vector_name,
-                sparse_vector_name=self.settings.sparse_vector_name,
-                timeout=self.settings.qdrant_timeout,
-            )
-        raise RuntimeConfigurationError(f"Unsupported backend: {self.settings.backend}")
-
-    def _build_sparse_store(self) -> MemoryBM25Store:
-        store = MemoryBM25Store()
-        if self.settings.backend != "qdrant_hybrid":
-            store.upsert(self.indexing_result.records)
-        return store
+        qdrant_path = self.settings.qdrant_path
+        if self.settings.qdrant_url is None and qdrant_path is None:
+            qdrant_path = self.settings.index_path.parent / "qdrant_hybrid"
+        return QdrantHybridVectorStore(
+            url=self.settings.qdrant_url,
+            path=qdrant_path,
+            api_key=self.settings.qdrant_api_key,
+            collection_name=self.settings.qdrant_collection,
+            vector_size=self.indexing_result.manifest.embedding_dimension,
+            dense_vector_name=self.settings.dense_vector_name,
+            sparse_vector_name=self.settings.sparse_vector_name,
+            timeout=self.settings.qdrant_timeout,
+        )
 
     def _build_reranker(self) -> object:
         return build_reranker(

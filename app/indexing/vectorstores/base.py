@@ -15,7 +15,7 @@ class VectorSearchResult:
         self.score = score
 
 
-class VectorStore(Protocol):
+class HybridVectorStore(Protocol):
     def upsert(self, records: list[IndexRecord]) -> None:
         """Insert or replace index records."""
 
@@ -25,11 +25,15 @@ class VectorStore(Protocol):
     def count(self) -> int:
         """Return indexed record count."""
 
-    def search(
+    def hybrid_search(
         self,
-        query_vector: list[float],
         *,
+        dense_vector: list[float],
+        sparse_indices: list[int],
+        sparse_values: list[float],
         top_k: int = 10,
+        dense_top_k: int = 50,
+        sparse_top_k: int = 50,
         filters: dict[str, object] | None = None,
     ) -> list[VectorSearchResult]:
-        """Return the nearest records for a query vector."""
+        """Return hybrid dense+sparse results for a query vector pair."""
