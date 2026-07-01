@@ -28,6 +28,42 @@ class SecuritySettings(BaseModel):
     dev_max_classification: str | None = None
     dev_allow_header_override: bool = True
 
+    jwt_secret: str = "change-me-local-rag-jwt-secret"
+    jwt_issuer: str = "enterprise-rag"
+    jwt_audience: str = "enterprise-rag-api"
+    jwt_expire_minutes: int = Field(default=480, ge=1)
+
+    jwt_admin_username: str = "admin"
+    jwt_admin_password: str = "admin123"
+    jwt_admin_subject: str = "admin"
+    jwt_admin_tenant_id: str | None = "tenant-a"
+    jwt_admin_user_id: str | None = "admin"
+    jwt_admin_email: str | None = None
+    jwt_admin_group_ids: list[str] = Field(default_factory=lambda: ["admin"])
+    jwt_admin_roles: list[str] = Field(default_factory=lambda: ["document_manager"])
+    jwt_admin_scopes: list[str] = Field(
+        default_factory=lambda: [
+            "rag:chat",
+            "rag:retrieve",
+            "rag:models",
+            "rag:documents",
+        ]
+    )
+    jwt_admin_max_classification: str | None = "secret"
+
+    jwt_user_username: str = "user"
+    jwt_user_password: str = "user123"
+    jwt_user_subject: str = "user"
+    jwt_user_tenant_id: str | None = "tenant-a"
+    jwt_user_user_id: str | None = "user"
+    jwt_user_email: str | None = None
+    jwt_user_group_ids: list[str] = Field(default_factory=list)
+    jwt_user_roles: list[str] = Field(default_factory=lambda: ["user"])
+    jwt_user_scopes: list[str] = Field(
+        default_factory=lambda: ["rag:chat", "rag:retrieve", "rag:models"]
+    )
+    jwt_user_max_classification: str | None = "internal"
+
     oidc_issuer: str | None = None
     oidc_audience: str | None = None
     oidc_jwks_url: str | None = None
@@ -60,6 +96,40 @@ class SecuritySettings(BaseModel):
             ),
             dev_max_classification=_optional_str("RAG_DEV_MAX_CLASSIFICATION"),
             dev_allow_header_override=_bool("RAG_DEV_ALLOW_HEADER_OVERRIDE", True),
+            jwt_secret=_str("RAG_JWT_SECRET", "change-me-local-rag-jwt-secret"),
+            jwt_issuer=_str("RAG_JWT_ISSUER", "enterprise-rag"),
+            jwt_audience=_str("RAG_JWT_AUDIENCE", "enterprise-rag-api"),
+            jwt_expire_minutes=_int("RAG_JWT_EXPIRE_MINUTES", 480),
+            jwt_admin_username=_str("RAG_JWT_ADMIN_USERNAME", "admin"),
+            jwt_admin_password=_str("RAG_JWT_ADMIN_PASSWORD", "admin123"),
+            jwt_admin_subject=_str("RAG_JWT_ADMIN_SUBJECT", "admin"),
+            jwt_admin_tenant_id=_optional_str("RAG_JWT_ADMIN_TENANT_ID") or "tenant-a",
+            jwt_admin_user_id=_optional_str("RAG_JWT_ADMIN_USER_ID") or "admin",
+            jwt_admin_email=_optional_str("RAG_JWT_ADMIN_EMAIL"),
+            jwt_admin_group_ids=_csv("RAG_JWT_ADMIN_GROUP_IDS", ["admin"]),
+            jwt_admin_roles=_csv("RAG_JWT_ADMIN_ROLES", ["document_manager"]),
+            jwt_admin_scopes=_csv(
+                "RAG_JWT_ADMIN_SCOPES",
+                ["rag:chat", "rag:retrieve", "rag:models", "rag:documents"],
+            ),
+            jwt_admin_max_classification=(
+                _optional_str("RAG_JWT_ADMIN_MAX_CLASSIFICATION") or "secret"
+            ),
+            jwt_user_username=_str("RAG_JWT_USER_USERNAME", "user"),
+            jwt_user_password=_str("RAG_JWT_USER_PASSWORD", "user123"),
+            jwt_user_subject=_str("RAG_JWT_USER_SUBJECT", "user"),
+            jwt_user_tenant_id=_optional_str("RAG_JWT_USER_TENANT_ID") or "tenant-a",
+            jwt_user_user_id=_optional_str("RAG_JWT_USER_USER_ID") or "user",
+            jwt_user_email=_optional_str("RAG_JWT_USER_EMAIL"),
+            jwt_user_group_ids=_csv("RAG_JWT_USER_GROUP_IDS", []),
+            jwt_user_roles=_csv("RAG_JWT_USER_ROLES", ["user"]),
+            jwt_user_scopes=_csv(
+                "RAG_JWT_USER_SCOPES",
+                ["rag:chat", "rag:retrieve", "rag:models"],
+            ),
+            jwt_user_max_classification=(
+                _optional_str("RAG_JWT_USER_MAX_CLASSIFICATION") or "internal"
+            ),
             oidc_issuer=_optional_str("RAG_OIDC_ISSUER"),
             oidc_audience=_optional_str("RAG_OIDC_AUDIENCE"),
             oidc_jwks_url=_optional_str("RAG_OIDC_JWKS_URL"),
@@ -97,6 +167,11 @@ def _bool(name: str, default: bool) -> bool:
     if value is None or value.strip() == "":
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return default if value is None or value.strip() == "" else int(value)
 
 
 def _csv(name: str, default: list[str]) -> list[str]:

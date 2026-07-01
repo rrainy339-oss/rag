@@ -1,10 +1,21 @@
 (function () {
-  const STORAGE_KEY = "rag-auth-session-v1";
+  const ADMIN_STORAGE_KEY = "rag-admin-auth-session-v1";
+  const CHAT_STORAGE_KEY = "rag-chat-auth-session-v1";
   const DEFAULT_API_BASE = "http://localhost:8000";
+
+  const state = {
+    storageKey: CHAT_STORAGE_KEY,
+    loginPage: "./chat-login.html",
+  };
+
+  function configure(options) {
+    state.storageKey = options?.storageKey || state.storageKey;
+    state.loginPage = options?.loginPage || state.loginPage;
+  }
 
   function getSession() {
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
+      const raw = window.localStorage.getItem(state.storageKey);
       return raw ? JSON.parse(raw) : null;
     } catch {
       return null;
@@ -13,7 +24,7 @@
 
   function saveSession(session) {
     window.localStorage.setItem(
-      STORAGE_KEY,
+      state.storageKey,
       JSON.stringify({
         ...session,
         apiBase: normalizeApiBase(session.apiBase || DEFAULT_API_BASE),
@@ -23,7 +34,7 @@
   }
 
   function clearSession() {
-    window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(state.storageKey);
   }
 
   function apiBase() {
@@ -38,24 +49,35 @@
   function authHeaders(extraHeaders) {
     const session = getSession();
     const headers = { ...(extraHeaders || {}) };
-    if (!session) return headers;
-
-    if (session.authMode === "oidc" && session.bearerToken) {
-      headers.Authorization = `Bearer ${session.bearerToken}`;
+    if (session?.accessToken) {
+      headers.Authorization = `Bearer ${session.accessToken}`;
     }
-
-    if (session.authMode === "dev") {
-      setHeader(headers, "x-rag-subject", session.subject);
-      setHeader(headers, "x-rag-tenant-id", session.tenantId);
-      setHeader(headers, "x-rag-user-id", session.userId);
-      setHeader(headers, "x-rag-email", session.email);
-      setHeader(headers, "x-rag-group-ids", listValue(session.groupIds));
-      setHeader(headers, "x-rag-roles", listValue(session.roles));
-      setHeader(headers, "x-rag-scopes", listValue(session.scopes));
-      setHeader(headers, "x-rag-max-classification", session.maxClassification);
-    }
-
     return headers;
+  }
+
+  async function login(kind, credentials) {
+    const apiBaseValue = normalizeApiBase(credentials.apiBase || DEFAULT_API_BASE);
+    const response = await window.fetch(`${apiBaseValue}/api/auth/${kind}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: credentials.username,
+        password: credentials.password,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(await errorMessage(response));
+    }
+    const token = await response.json();
+    saveSession({
+      apiBase: apiBaseValue,
+      accessToken: token.access_token,
+      tokenType: token.token_type || "bearer",
+      expiresIn: token.expires_in,
+      principal: token.principal,
+      loginKind: kind,
+    });
+    return token;
   }
 
   async function request(path, options) {
@@ -79,7 +101,7 @@
 
   async function requireIdentity(options) {
     const session = getSession();
-    if (!session) {
+    if (!session?.accessToken) {
       redirectToLogin();
       return null;
     }
@@ -105,12 +127,18 @@
   function can(me, scope) {
     if (!me) return false;
     if (!me.enforce_permissions) return true;
-    return Array.isArray(me.scopes) && (me.scopes.includes(scope) || me.scopes.includes("rag:admin"));
+    return (
+      Array.isArray(me.scopes) &&
+      (me.scopes.includes(scope) || me.scopes.includes("rag:admin"))
+    );
   }
 
   function redirectToLogin(message) {
-    const target = new URL("./login.html", window.location.href);
-    target.searchParams.set("next", window.location.pathname.split("/").pop() || "chat.html");
+    const target = new URL(state.loginPage, window.location.href);
+    const currentPage = window.location.pathname.split("/").pop();
+    if (currentPage) {
+      target.searchParams.set("next", currentPage);
+    }
     if (message) {
       target.searchParams.set("message", message);
     }
@@ -127,17 +155,6 @@
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean);
-  }
-
-  function listValue(value) {
-    return Array.isArray(value) ? value.join(",") : String(value || "");
-  }
-
-  function setHeader(headers, name, value) {
-    const cleaned = String(value || "").trim();
-    if (cleaned) {
-      headers[name] = cleaned;
-    }
   }
 
   async function errorMessage(response) {
@@ -159,16 +176,19 @@
   }
 
   window.RagAuth = {
+    ADMIN_STORAGE_KEY,
+    CHAT_STORAGE_KEY,
     DEFAULT_API_BASE,
-    STORAGE_KEY,
     apiBase,
     apiUrl,
     authHeaders,
     can,
     clearSession,
+    configure,
     escapeHtml,
     getSession,
     loadMe,
+    login,
     request,
     requestJson,
     requireIdentity,

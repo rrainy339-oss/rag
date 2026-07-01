@@ -13,8 +13,16 @@ from app.api.settings import APISettings
 from app.chunking.config import ChunkingConfig
 from app.chunking.pipeline import ChunkingPipeline
 from app.chunking.schemas import ChunkingResult
+from app.documents.jobs import DocumentJobRegistry, TERMINAL_JOB_STATUSES
 from app.documents.registry import DocumentRegistry
-from app.documents.schemas import DocumentRecord, DocumentStatus
+from app.documents.schemas import (
+    DocumentJob,
+    DocumentJobStage,
+    DocumentJobStatus,
+    DocumentJobType,
+    DocumentRecord,
+    DocumentStatus,
+)
 from app.domain.schemas import AccessControl, ParsedDocument
 from app.indexing.config import IndexingConfig
 from app.indexing.embeddings.bge import BGEM3EmbeddingProvider
@@ -39,10 +47,12 @@ class DocumentService:
         settings: APISettings,
         *,
         registry: DocumentRegistry | None = None,
+        job_registry: DocumentJobRegistry | None = None,
         on_collection_updated: CollectionUpdated | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry or DocumentRegistry(settings.documents_db_path)
+        self.job_registry = job_registry or DocumentJobRegistry(settings.documents_db_path)
         self.on_collection_updated = on_collection_updated
         self._collection_lock = Lock()
 
@@ -103,27 +113,113 @@ class DocumentService:
     def get_document(self, document_id: str) -> DocumentRecord | None:
         return self.registry.get(document_id)
 
-    def process_document(self, document_id: str) -> DocumentRecord:
+    def enqueue_document(
+        self,
+        document_id: str,
+        *,
+        job_type: DocumentJobType = DocumentJobType.INGEST,
+    ) -> DocumentJob:
+        self._require_document(document_id)
+        return self.job_registry.create(document_id=document_id, job_type=job_type)
+
+    def list_jobs(
+        self,
+        *,
+        document_id: str | None = None,
+        include_terminal: bool = True,
+        limit: int = 100,
+    ) -> list[DocumentJob]:
+        return self.job_registry.list(
+            document_id=document_id,
+            include_terminal=include_terminal,
+            limit=limit,
+        )
+
+    def latest_job(self, document_id: str) -> DocumentJob | None:
+        return self.job_registry.latest_for_document(document_id)
+
+    def get_job(self, job_id: str) -> DocumentJob | None:
+        return self.job_registry.get(job_id)
+
+    def cancel_job(self, job_id: str) -> DocumentJob:
+        return self.job_registry.request_cancel(job_id)
+
+    def retry_job(self, job_id: str) -> DocumentJob:
+        return self.job_registry.retry(job_id)
+
+    def run_next_job(self, *, worker_id: str = "local-worker") -> DocumentJob | None:
+        job = self.job_registry.claim_next(worker_id=worker_id)
+        if job is None:
+            return None
+        return self.run_job(job.job_id, worker_id=worker_id)
+
+    def run_job(self, job_id: str, *, worker_id: str = "local-worker") -> DocumentJob:
+        job = self.job_registry.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if job.status in TERMINAL_JOB_STATUSES:
+            return job
+        if job.status != DocumentJobStatus.RUNNING:
+            claimed = self.job_registry.claim(job_id, worker_id=worker_id)
+            if claimed is None:
+                raise ValueError(f"Job {job_id} is not ready to run.")
+            job = claimed
+
+        try:
+            self._raise_if_cancelled(job.job_id)
+            if job.job_type in {DocumentJobType.INGEST, DocumentJobType.REINDEX}:
+                self.process_document(
+                    job.document_id,
+                    job_id=job.job_id,
+                    raise_errors=True,
+                )
+            else:
+                raise ValueError(f"Unsupported document job type: {job.job_type}")
+            return self.job_registry.mark_succeeded(job.job_id)
+        except _JobCancelled:
+            return self.job_registry.mark_cancelled(job.job_id)
+        except Exception as exc:
+            return self.job_registry.mark_failed(
+                job.job_id,
+                error_message=str(exc),
+                retry_delay_seconds=_retry_delay_seconds(job.attempt),
+            )
+
+    def process_document(
+        self,
+        document_id: str,
+        *,
+        job_id: str | None = None,
+        raise_errors: bool = False,
+    ) -> DocumentRecord:
         try:
             record = self._require_document(document_id)
+            self._set_job_stage(job_id, DocumentJobStage.PARSING, 10)
             record = self.registry.update_status(record.document_id, DocumentStatus.PARSING)
             parsed_document, parsed_json_path = self._parse_document(record)
+            self._raise_if_cancelled(job_id)
 
+            self._set_job_stage(job_id, DocumentJobStage.CHUNKING, 35)
             self.registry.update_artifacts(
                 record.document_id,
                 parsed_path=parsed_json_path,
                 status=DocumentStatus.CHUNKING,
             )
             chunking_result, chunks_path = self._chunk_document(record, parsed_document)
+            self._raise_if_cancelled(job_id)
 
+            self._set_job_stage(job_id, DocumentJobStage.EMBEDDING, 60)
             self.registry.update_artifacts(
                 record.document_id,
                 chunks_path=chunks_path,
                 chunk_count=len(chunking_result.chunks),
                 status=DocumentStatus.INDEXING,
             )
+            self._set_job_stage(job_id, DocumentJobStage.INDEXING, 75)
             indexing_result, index_path = self._index_document(record, chunking_result)
+            self._raise_if_cancelled(job_id)
 
+            self._set_job_stage(job_id, DocumentJobStage.REBUILDING_COLLECTION, 90)
             record = self.registry.update_artifacts(
                 record.document_id,
                 index_path=index_path,
@@ -134,6 +230,18 @@ class DocumentService:
             self.rebuild_collection()
             self._notify_collection_updated()
             return record
+        except _JobCancelled:
+            record = self._require_document(document_id)
+            if record.status != DocumentStatus.READY:
+                record = self.registry.update_status(
+                    document_id,
+                    DocumentStatus.UPLOADED,
+                    error_message="Job cancelled.",
+                )
+            self._notify_collection_updated()
+            if raise_errors:
+                raise
+            return record
         except Exception as exc:
             record = self.registry.update_status(
                 document_id,
@@ -141,6 +249,8 @@ class DocumentService:
                 error_message=str(exc),
             )
             self._notify_collection_updated()
+            if raise_errors:
+                raise
             return record
 
     def reindex_document(self, document_id: str) -> DocumentRecord:
@@ -149,6 +259,7 @@ class DocumentService:
 
     def delete_document(self, document_id: str) -> DocumentRecord:
         existing = self._require_document(document_id)
+        self._cancel_document_jobs(document_id)
         self._delete_index_records(existing)
         record = self.registry.update_status(document_id, DocumentStatus.DELETED)
         self.rebuild_collection()
@@ -411,6 +522,33 @@ class DocumentService:
         if self.on_collection_updated is not None:
             self.on_collection_updated()
 
+    def _set_job_stage(
+        self,
+        job_id: str | None,
+        stage: DocumentJobStage,
+        progress: int,
+    ) -> None:
+        if job_id is not None:
+            self.job_registry.set_stage(job_id, stage=stage, progress=progress)
+
+    def _raise_if_cancelled(self, job_id: str | None) -> None:
+        if job_id is None:
+            return
+        job = self.job_registry.get(job_id)
+        if job is not None and job.cancel_requested:
+            raise _JobCancelled()
+
+    def _cancel_document_jobs(self, document_id: str) -> None:
+        for job in self.job_registry.list(
+            document_id=document_id,
+            include_terminal=False,
+        ):
+            self.job_registry.request_cancel(job.job_id)
+
+
+class _JobCancelled(RuntimeError):
+    pass
+
 
 def _combine_chunks(records: list[DocumentRecord]) -> ChunkingResult:
     results = [
@@ -649,6 +787,12 @@ def _hash_values(values: list[str]) -> str:
         digest.update(value.encode("utf-8"))
         digest.update(b"\x1f")
     return digest.hexdigest()
+
+
+def _retry_delay_seconds(attempt: int) -> int:
+    delays = [30, 120, 600]
+    index = max(0, min(len(delays) - 1, attempt - 1))
+    return delays[index]
 
 
 def _safe_filename(value: str) -> str:

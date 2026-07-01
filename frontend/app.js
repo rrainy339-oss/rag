@@ -1,6 +1,4 @@
 (function () {
-  const key = "rag-auth-session-v1";
-  const hasSession = Boolean(window.localStorage.getItem(key));
-  const target = hasSession ? "./chat.html" : "./login.html";
-  window.setTimeout(() => window.location.replace(target), 80);
+  // Gateway page intentionally stays passive. Admin and chat frontends keep
+  // separate JWT sessions and must be entered through their own login pages.
 })();

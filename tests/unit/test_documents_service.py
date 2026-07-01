@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from app.api.settings import APISettings
-from app.documents.schemas import DocumentRecord, DocumentStatus
+from app.documents.schemas import DocumentJobStatus, DocumentRecord, DocumentStatus
 from app.documents.service import DocumentService
 from app.indexing.schemas import IndexBackend, IndexingResult
 from tests.unit.hybrid_fakes import CapturingHybridVectorStore, FakeHybridEmbeddingProvider
@@ -205,6 +205,77 @@ class DocumentServiceTest(unittest.TestCase):
         self.assertEqual(synced_record.metadata["allowed_group_ids"], ["finance"])
         self.assertEqual(synced_record.metadata["allowed_user_ids"], ["user-2"])
         self.assertEqual(synced_record.metadata["classification"], "secret")
+
+    def test_document_job_runs_successfully_from_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            record = service.registry.create(_record(root))
+            called: dict[str, object] = {}
+
+            def process_document(
+                document_id: str,
+                *,
+                job_id: str | None = None,
+                raise_errors: bool = False,
+            ) -> DocumentRecord:
+                called["document_id"] = document_id
+                called["job_id"] = job_id
+                called["raise_errors"] = raise_errors
+                return record
+
+            service.process_document = process_document  # type: ignore[method-assign]
+            queued = service.enqueue_document(record.document_id)
+            completed = service.run_next_job(worker_id="test-worker")
+
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.status, DocumentJobStatus.SUCCEEDED)
+        self.assertEqual(completed.progress, 100)
+        self.assertEqual(completed.attempt, 1)
+        self.assertEqual(called["document_id"], record.document_id)
+        self.assertEqual(called["job_id"], queued.job_id)
+        self.assertTrue(called["raise_errors"])
+
+    def test_document_job_failure_respects_max_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            record = service.registry.create(_record(root))
+
+            def process_document(
+                document_id: str,
+                *,
+                job_id: str | None = None,
+                raise_errors: bool = False,
+            ) -> DocumentRecord:
+                del document_id, job_id, raise_errors
+                raise RuntimeError("boom")
+
+            service.process_document = process_document  # type: ignore[method-assign]
+            queued = service.enqueue_document(record.document_id)
+            service.job_registry.update(queued.job_id, max_attempts=1)
+            failed = service.run_next_job(worker_id="test-worker")
+
+        self.assertIsNotNone(failed)
+        self.assertEqual(failed.status, DocumentJobStatus.FAILED)
+        self.assertEqual(failed.attempt, 1)
+        self.assertEqual(failed.error_message, "boom")
+
+    def test_cancelled_queued_document_job_is_not_claimed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            record = service.registry.create(_record(root))
+            queued = service.enqueue_document(record.document_id)
+
+            cancelled = service.cancel_job(queued.job_id)
+            next_job = service.run_next_job(worker_id="test-worker")
+
+        self.assertEqual(cancelled.status, DocumentJobStatus.CANCELLED)
+        self.assertIsNone(next_job)
 
 
 def _document_settings(root: Path) -> APISettings:

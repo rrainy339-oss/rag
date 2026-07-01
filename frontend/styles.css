@@ -855,6 +855,34 @@ svg {
   color: var(--danger) !important;
 }
 
+.job-summary {
+  display: grid !important;
+  gap: 5px;
+  min-width: 150px;
+  margin-top: 7px !important;
+  color: var(--muted) !important;
+  font-size: 12px;
+}
+
+.job-progress {
+  position: relative;
+  display: block !important;
+  width: 150px;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-strong);
+}
+
+.job-progress::after {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--progress, 0%);
+  border-radius: inherit;
+  background: var(--accent);
+  content: "";
+}
+
 .row-actions {
   display: flex;
   flex-wrap: wrap;

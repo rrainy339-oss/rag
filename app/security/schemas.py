@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-AuthMode = Literal["disabled", "dev", "oidc"]
+AuthMode = Literal["disabled", "dev", "jwt", "oidc"]
 
 
 class Principal(BaseModel):
@@ -25,4 +25,3 @@ class AuthError(RuntimeError):
     def __init__(self, message: str, *, status_code: int = 401) -> None:
         super().__init__(message)
         self.status_code = status_code
-

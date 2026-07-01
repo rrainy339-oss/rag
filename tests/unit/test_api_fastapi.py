@@ -108,6 +108,72 @@ class FastAPIAppTest(unittest.TestCase):
         self.assertTrue(payload["can_chat"])
         self.assertTrue(payload["can_manage_documents"])
 
+    def test_jwt_login_issues_tokens_for_separate_frontends(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from app.api import main as api_main
+        from app.security import SecuritySettings
+
+        api_main.security_settings = SecuritySettings(
+            auth_mode="jwt",
+            jwt_secret="test-secret",
+            jwt_admin_username="admin",
+            jwt_admin_password="admin-pass",
+            jwt_user_username="user",
+            jwt_user_password="user-pass",
+        )
+        api_main.audit_logger = api_main.AuditLogger.from_settings(
+            api_main.security_settings
+        )
+        client = TestClient(api_main.app)
+
+        admin_login = client.post(
+            "/api/auth/admin/login",
+            json={"username": "admin", "password": "admin-pass"},
+            headers={"x-request-id": "admin-login-test"},
+        )
+        chat_login = client.post(
+            "/api/auth/chat/login",
+            json={"username": "user", "password": "user-pass"},
+            headers={"x-request-id": "chat-login-test"},
+        )
+
+        admin_token = admin_login.json()["access_token"]
+        user_token = chat_login.json()["access_token"]
+        admin_me = client.get(
+            "/api/me",
+            headers={
+                "authorization": f"Bearer {admin_token}",
+                "x-request-id": "admin-me-test",
+            },
+        )
+        user_me = client.get(
+            "/api/me",
+            headers={
+                "authorization": f"Bearer {user_token}",
+                "x-request-id": "user-me-test",
+            },
+        )
+        user_documents = client.get(
+            "/api/documents",
+            headers={
+                "authorization": f"Bearer {user_token}",
+                "x-request-id": "user-documents-test",
+            },
+        )
+        api_main.security_settings = SecuritySettings(auth_mode="disabled")
+        api_main.audit_logger = api_main.AuditLogger.from_settings(
+            api_main.security_settings
+        )
+
+        self.assertEqual(admin_login.status_code, 200)
+        self.assertEqual(chat_login.status_code, 200)
+        self.assertTrue(admin_me.json()["can_manage_documents"])
+        self.assertTrue(admin_me.json()["can_chat"])
+        self.assertFalse(user_me.json()["can_manage_documents"])
+        self.assertTrue(user_me.json()["can_chat"])
+        self.assertEqual(user_documents.status_code, 403)
+
     def test_document_upload_accepts_permission_fields(self) -> None:
         from fastapi.testclient import TestClient
 
@@ -131,24 +197,19 @@ class FastAPIAppTest(unittest.TestCase):
             api_main.settings = api_main.APISettings(**settings_data)
             api_main.reset_runtime_for_tests()
             with TestClient(api_main.app) as client:
-                with patch.object(
-                    api_main.DocumentService,
-                    "process_document",
-                    return_value=None,
-                ):
-                    response = client.post(
-                        "/api/documents",
-                        files={"file": ("policy.txt", b"hello", "text/plain")},
-                        data={
-                            "title": "Policy",
-                            "tenant_id": "tenant-a",
-                            "owner_id": "owner-1",
-                            "group_ids": "legal, compliance",
-                            "principal_ids": "user-1, user-2",
-                            "classification": "confidential",
-                        },
-                        headers={"x-request-id": "upload-test"},
-                    )
+                response = client.post(
+                    "/api/documents",
+                    files={"file": ("policy.txt", b"hello", "text/plain")},
+                    data={
+                        "title": "Policy",
+                        "tenant_id": "tenant-a",
+                        "owner_id": "owner-1",
+                        "group_ids": "legal, compliance",
+                        "principal_ids": "user-1, user-2",
+                        "classification": "confidential",
+                    },
+                    headers={"x-request-id": "upload-test"},
+                )
             api_main.reset_runtime_for_tests()
 
         self.assertEqual(response.status_code, 200)
@@ -159,6 +220,56 @@ class FastAPIAppTest(unittest.TestCase):
         self.assertEqual(payload["group_ids"], ["legal", "compliance"])
         self.assertEqual(payload["principal_ids"], ["user-1", "user-2"])
         self.assertEqual(payload["classification"], "confidential")
+        self.assertEqual(payload["job"]["status"], "queued")
+        self.assertEqual(payload["job"]["job_type"], "ingest")
+
+    def test_document_job_management_endpoints(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from app.api import main as api_main
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings, _ = _settings(Path(temp_dir))
+            settings_data = settings.model_dump()
+            settings_data.update(
+                {
+                    "documents_db_path": Path(temp_dir) / "documents.sqlite3",
+                    "documents_storage_dir": Path(temp_dir) / "documents",
+                    "documents_collection_index_path": Path(temp_dir)
+                    / "collection"
+                    / "index.json",
+                    "documents_collection_chunks_path": Path(temp_dir)
+                    / "collection"
+                    / "chunks.json",
+                }
+            )
+            api_main.settings = api_main.APISettings(**settings_data)
+            api_main.reset_runtime_for_tests()
+            with TestClient(api_main.app) as client:
+                upload = client.post(
+                    "/api/documents",
+                    files={"file": ("policy.txt", b"hello", "text/plain")},
+                    data={"title": "Policy"},
+                )
+                payload = upload.json()
+                document_id = payload["document_id"]
+                job_id = payload["job"]["job_id"]
+                listed = client.get("/api/jobs")
+                cancelled = client.post(f"/api/jobs/{job_id}/cancel")
+                retried = client.post(f"/api/jobs/{job_id}/retry")
+                reindex = client.post(f"/api/documents/{document_id}/reindex")
+            api_main.reset_runtime_for_tests()
+
+        self.assertEqual(upload.status_code, 200)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["jobs"][0]["job_id"], job_id)
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["status"], "cancelled")
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(retried.json()["status"], "queued")
+        self.assertEqual(reindex.status_code, 200)
+        self.assertEqual(reindex.json()["job"]["job_type"], "reindex")
+        self.assertEqual(reindex.json()["job"]["status"], "queued")
 
     def test_dev_auth_principal_overrides_request_acl_fields(self) -> None:
         from fastapi.testclient import TestClient

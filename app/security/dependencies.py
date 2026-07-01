@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import Request
 
 from app.security.config import SecuritySettings
+from app.security.jwt import decode_jwt
 from app.security.schemas import AuthError, Principal
 
 
@@ -17,6 +18,8 @@ def authenticate_request(request: Request, settings: SecuritySettings) -> Princi
         )
     if settings.auth_mode == "dev":
         return _dev_principal(request, settings)
+    if settings.auth_mode == "jwt":
+        return _jwt_principal(request, settings)
     if settings.auth_mode == "oidc":
         return _oidc_principal(request, settings)
     raise AuthError(f"Unsupported auth mode: {settings.auth_mode}", status_code=500)
@@ -66,6 +69,31 @@ def _oidc_principal(request: Request, settings: SecuritySettings) -> Principal:
     token = _bearer_token(request)
     claims = _decode_oidc_token(token, settings)
     return _principal_from_claims(claims, settings)
+
+
+def _jwt_principal(request: Request, settings: SecuritySettings) -> Principal:
+    claims = decode_jwt(
+        _bearer_token(request),
+        secret=settings.jwt_secret,
+        issuer=settings.jwt_issuer,
+        audience=settings.jwt_audience,
+    )
+    subject = _claim_str(claims, "sub")
+    if not subject:
+        raise AuthError("Token is missing subject claim.", status_code=401)
+
+    return Principal(
+        subject=subject,
+        tenant_id=_claim_str(claims, "tenant_id"),
+        user_id=_claim_str(claims, "user_id") or subject,
+        email=_claim_str(claims, "email"),
+        group_ids=_claim_list(claims, "group_ids"),
+        roles=_claim_list(claims, "roles"),
+        scopes=_claim_list(claims, "scopes"),
+        max_classification=_claim_str(claims, "max_classification"),
+        auth_mode="jwt",
+        enforce_permissions=True,
+    )
 
 
 def _decode_oidc_token(token: str, settings: SecuritySettings) -> dict[str, Any]:
@@ -167,4 +195,3 @@ def _claim_list(claims: dict[str, Any], name: str) -> list[str]:
 
 def _split_values(value: str) -> list[str]:
     return [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
-

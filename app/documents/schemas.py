@@ -16,6 +16,33 @@ class DocumentStatus(StrEnum):
     DELETED = "deleted"
 
 
+class DocumentJobType(StrEnum):
+    INGEST = "ingest"
+    REINDEX = "reindex"
+
+
+class DocumentJobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    RETRYING = "retrying"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+
+
+class DocumentJobStage(StrEnum):
+    QUEUED = "queued"
+    PARSING = "parsing"
+    CHUNKING = "chunking"
+    EMBEDDING = "embedding"
+    INDEXING = "indexing"
+    REBUILDING_COLLECTION = "rebuilding_collection"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class DocumentRecord(BaseModel):
     document_id: str
     filename: str
@@ -38,3 +65,24 @@ class DocumentRecord(BaseModel):
     indexed_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class DocumentJob(BaseModel):
+    job_id: str
+    document_id: str
+    job_type: DocumentJobType
+    status: DocumentJobStatus = DocumentJobStatus.QUEUED
+    stage: DocumentJobStage = DocumentJobStage.QUEUED
+    attempt: int = 0
+    max_attempts: int = 3
+    progress: int = 0
+    cancel_requested: bool = False
+    error_message: str | None = None
+    locked_by: str | None = None
+    locked_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    next_run_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime | None = None
+    finished_at: datetime | None = None

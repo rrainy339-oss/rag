@@ -25,7 +25,8 @@ have been removed from the test branch.
 - `app/retrieval/qdrant_hybrid.py`: Qdrant hybrid retrieval pipeline.
 - `app/retrieval/rerankers/`: optional BGE, Qwen, Cohere, and Voyage rerankers.
 - `app/answering/`: context packing, prompts, and LLM provider adapters.
-- `app/security/`: dev/OIDC auth, permission context, and audit logging.
+- `app/security/`: dev/JWT/OIDC auth, permission context, and audit logging.
+- `scripts/document_worker.py`: durable document job worker.
 - `scripts/parse_local.py`: optional parser debugging utility.
 - `scripts/chunk_parsed.py`: optional chunking debugging utility.
 - `scripts/answer.py`: optional answer-layer debugging utility.
@@ -76,6 +77,8 @@ $env:RAG_API_QDRANT_COLLECTION="rag_chunks"
 $env:RAG_API_DENSE_VECTOR_NAME="dense"
 $env:RAG_API_SPARSE_VECTOR_NAME="sparse"
 $env:RAG_API_LLM_PROVIDER="mock"
+$env:RAG_AUTH_MODE="jwt"
+$env:RAG_JWT_SECRET="replace-this-local-secret"
 
 .\.venv\Scripts\python.exe -m uvicorn app.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
@@ -89,9 +92,30 @@ $env:RAG_API_QDRANT_COLLECTION="rag_chunks"
 
 The runtime only supports `qdrant_hybrid` and `bge-m3`; those are the defaults.
 
+## Start The Document Worker
+
+Uploads and reindex requests create durable rows in `document_jobs`. Run a
+separate worker process to execute parsing, chunking, BGE-M3 dense+sparse
+encoding, Qdrant hybrid upsert, retry, cancellation checks, and progress updates:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\document_worker.py
+```
+
+For a smoke test that claims at most one runnable job:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\document_worker.py --once
+```
+
+The API process watches the collection artifact timestamps and reloads its
+runtime after the worker rebuilds the collection files.
+
 ## API Endpoints
 
 - `GET /healthz`
+- `POST /api/auth/admin/login`
+- `POST /api/auth/chat/login`
 - `GET /api/me`
 - `POST /api/retrieve`
 - `POST /api/chat`
@@ -101,12 +125,20 @@ The runtime only supports `qdrant_hybrid` and `bge-m3`; those are the defaults.
 - `PATCH /api/documents/{document_id}/permissions`
 - `POST /api/documents/{document_id}/reindex`
 - `DELETE /api/documents/{document_id}`
+- `GET /api/jobs`
+- `GET /api/jobs/{job_id}`
+- `POST /api/jobs/{job_id}/cancel`
+- `POST /api/jobs/{job_id}/retry`
+- `POST /api/jobs/run-next`
 
-Document upload processing runs in a background task:
+Document upload processing now runs through the durable `document_jobs` table:
 
 ```text
-uploaded -> parsing -> chunking -> indexing -> ready
+queued -> running -> parsing -> chunking -> embedding -> indexing -> ready
 ```
+
+Failed jobs move to `retrying` until `max_attempts` is exhausted, then `failed`.
+Queued and running jobs can be cancelled from the API or administrator frontend.
 
 Each upload can include access fields:
 
@@ -121,28 +153,38 @@ permission filtering.
 
 ## Frontend Test Flow
 
-Open the login page:
+Open the administrator login page:
 
 ```text
-D:\codex project\my rag\frontend\login.html
+D:\codex project\my rag\frontend\admin-login.html
 ```
 
-Use `Dev Header` mode for local testing. For an administrator account, keep or
-enter scopes like:
+Default local administrator credentials:
 
 ```text
-rag:chat,rag:retrieve,rag:models,rag:documents
+admin / admin123
 ```
 
-After login:
+Open the user Q&A login page:
 
-- `admin.html`: administrator document management. Upload documents, set access
-  fields, edit existing document permissions, reindex, and delete documents.
-- `chat.html`: user-facing Q&A. The page only sends chat/model requests; document
-  management is kept out of the Q&A surface.
+```text
+D:\codex project\my rag\frontend\chat-login.html
+```
 
-Document uploads refresh through parsing/chunking/indexing until the status is
-`ready`.
+Default local user credentials:
+
+```text
+user / user123
+```
+
+The two frontends keep separate browser sessions. After login, each request sends
+the issued JWT as an `Authorization: Bearer ...` header. The administrator
+frontend calls document management APIs; the user frontend only calls chat,
+retrieval, and model APIs.
+
+Keep `scripts/document_worker.py` running while testing uploads. Document rows
+show the latest job status and refresh through parsing/chunking/indexing until
+the document status is `ready`.
 
 Verify Qdrant:
 
@@ -181,11 +223,24 @@ $env:OPENAI_API_KEY="..."
 
 ## Authentication And Authorization
 
-The API supports three auth modes:
+The API supports four auth modes:
 
 - `disabled`: local demo mode; request ACL fields are accepted.
 - `dev`: trusted local simulation using environment variables or `x-rag-*` headers.
+- `jwt`: local JWT login mode using `/api/auth/admin/login` and
+  `/api/auth/chat/login`.
 - `oidc`: JWT/OIDC mode using JWKS and claim mapping.
+
+Local JWT auth example:
+
+```powershell
+$env:RAG_AUTH_MODE="jwt"
+$env:RAG_JWT_SECRET="replace-this-local-secret"
+$env:RAG_JWT_ADMIN_USERNAME="admin"
+$env:RAG_JWT_ADMIN_PASSWORD="admin123"
+$env:RAG_JWT_USER_USERNAME="user"
+$env:RAG_JWT_USER_PASSWORD="user123"
+```
 
 Development auth example:
 

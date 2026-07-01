@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>用户登录 - Enterprise RAG</title>
+    <link rel="stylesheet" href="./styles.css?v=5" />
+  </head>
+  <body class="login-page">
+    <main class="login-shell">
+      <section class="login-panel">
+        <div class="brand-row">
+          <span class="brand-mark">R</span>
+          <div>
+            <strong>知识问答登录</strong>
+            <span>用户账号只进入问答页面</span>
+          </div>
+        </div>
+
+        <form id="chat-login-form" class="login-form">
+          <div class="field">
+            <label for="api-base">API 地址</label>
+            <input id="api-base" type="url" value="http://localhost:8000" required />
+          </div>
+          <div class="field">
+            <label for="username">用户账号</label>
+            <input id="username" type="text" value="user" autocomplete="username" required />
+          </div>
+          <div class="field">
+            <label for="password">密码</label>
+            <input id="password" type="password" value="user123" autocomplete="current-password" required />
+          </div>
+          <button class="primary-button" type="submit">登录问答页面</button>
+          <p class="form-status" id="login-status"></p>
+        </form>
+
+      </section>
+    </main>
+    <script src="./auth.js?v=5"></script>
+    <script src="./chat-login.js?v=5"></script>
+  </body>
+</html>

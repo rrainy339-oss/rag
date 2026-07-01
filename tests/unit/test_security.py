@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from app.security import AuthError, SecuritySettings, authenticate_request, require_scope
+from app.security.jwt import encode_jwt
 
 
 class SecurityTest(unittest.TestCase):
@@ -55,6 +56,43 @@ class SecurityTest(unittest.TestCase):
             authenticate_request(
                 _request(),
                 SecuritySettings(auth_mode="oidc", oidc_jwks_url="https://issuer/jwks"),
+            )
+
+        self.assertEqual(error.exception.status_code, 401)
+
+    def test_jwt_auth_reads_bearer_claims(self) -> None:
+        token = encode_jwt(
+            {
+                "sub": "alice",
+                "tenant_id": "tenant-a",
+                "user_id": "u-alice",
+                "group_ids": ["hr", "finance"],
+                "roles": ["user"],
+                "scopes": ["rag:chat", "rag:retrieve"],
+                "max_classification": "confidential",
+            },
+            secret="test-secret",
+            issuer="enterprise-rag",
+            audience="enterprise-rag-api",
+            expires_in_seconds=60,
+        )
+
+        principal = authenticate_request(
+            _request(headers={"authorization": f"Bearer {token}"}),
+            SecuritySettings(auth_mode="jwt", jwt_secret="test-secret"),
+        )
+
+        self.assertEqual(principal.subject, "alice")
+        self.assertEqual(principal.tenant_id, "tenant-a")
+        self.assertEqual(principal.group_ids, ["hr", "finance"])
+        self.assertEqual(principal.scopes, ["rag:chat", "rag:retrieve"])
+        self.assertEqual(principal.auth_mode, "jwt")
+
+    def test_jwt_auth_rejects_missing_bearer_token(self) -> None:
+        with self.assertRaises(AuthError) as error:
+            authenticate_request(
+                _request(),
+                SecuritySettings(auth_mode="jwt", jwt_secret="test-secret"),
             )
 
         self.assertEqual(error.exception.status_code, 401)

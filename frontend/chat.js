@@ -1,3 +1,8 @@
+RagAuth.configure({
+  storageKey: RagAuth.CHAT_STORAGE_KEY,
+  loginPage: "./chat-login.html",
+});
+
 const STORAGE_KEY = "rag-chat-sessions-v2";
 const PROVIDER_DEFAULTS = {
   ollama: { baseUrl: "http://localhost:11434", model: "llama3.1" },
@@ -28,7 +33,6 @@ const els = {
   sidebar: document.querySelector("#sidebar"),
   backdrop: document.querySelector("#backdrop"),
   identityLabel: document.querySelector("#identity-label"),
-  adminLink: document.querySelector("#admin-link"),
   logoutButton: document.querySelector("#logout-button"),
   modeSelect: document.querySelector("#mode-select"),
   llmProvider: document.querySelector("#llm-provider"),
@@ -138,7 +142,6 @@ function renderIdentity() {
   const parts = [state.me?.subject || "用户"];
   if (state.me?.tenant_id) parts.push(state.me.tenant_id);
   els.identityLabel.textContent = parts.join(" / ");
-  els.adminLink.classList.toggle("hidden", !RagAuth.can(state.me, "rag:documents"));
 }
 
 function render() {
@@ -428,9 +431,9 @@ function closePanels() {
 
 function logout() {
   RagAuth.clearSession();
-  window.location.href = "./login.html";
+  window.location.href = "./chat-login.html";
 }
 
 function renderAccessDenied() {
-  document.body.innerHTML = '<main class="login-shell"><section class="login-panel"><h1>无权访问问答页面</h1><a class="primary-button link-action" href="./login.html">重新登录</a></section></main>';
+  document.body.innerHTML = '<main class="login-shell"><section class="login-panel"><h1>无权访问问答页面</h1><a class="primary-button link-action" href="./chat-login.html">重新登录</a></section></main>';
 }

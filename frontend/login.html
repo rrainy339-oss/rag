@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>登录 - Enterprise RAG</title>
-    <link rel="stylesheet" href="./styles.css?v=4" />
+    <title>选择登录入口 - Enterprise RAG</title>
+    <link rel="stylesheet" href="./styles.css?v=5" />
   </head>
   <body class="login-page">
     <main class="login-shell">
@@ -13,83 +13,14 @@
           <span class="brand-mark">R</span>
           <div>
             <strong>Enterprise RAG</strong>
-            <span>登录后进入对应工作台</span>
+            <span>请选择独立登录入口</span>
           </div>
         </div>
-
-        <form id="login-form" class="login-form">
-          <div class="field">
-            <label for="api-base">API 地址</label>
-            <input id="api-base" type="url" value="http://localhost:8000" required />
-          </div>
-
-          <div class="field">
-            <label for="auth-mode">认证模式</label>
-            <select id="auth-mode">
-              <option value="dev">Dev Header 本地模拟</option>
-              <option value="oidc">OIDC Bearer Token</option>
-              <option value="disabled">后端 disabled 模式</option>
-            </select>
-          </div>
-
-          <section class="auth-section" id="dev-fields">
-            <div class="field-grid">
-              <div class="field">
-                <label for="subject">Subject</label>
-                <input id="subject" type="text" value="admin-a" />
-              </div>
-              <div class="field">
-                <label for="tenant-id">租户</label>
-                <input id="tenant-id" type="text" value="tenant-a" />
-              </div>
-              <div class="field">
-                <label for="user-id">用户 ID</label>
-                <input id="user-id" type="text" value="admin-a" />
-              </div>
-              <div class="field">
-                <label for="email">邮箱</label>
-                <input id="email" type="email" placeholder="admin@example.com" />
-              </div>
-            </div>
-
-            <div class="field">
-              <label for="group-ids">用户组</label>
-              <input id="group-ids" type="text" value="admin,legal" />
-            </div>
-            <div class="field">
-              <label for="roles">角色</label>
-              <input id="roles" type="text" value="document_manager" />
-            </div>
-            <div class="field">
-              <label for="scopes">权限范围</label>
-              <input id="scopes" type="text" value="rag:chat,rag:retrieve,rag:models,rag:documents" />
-            </div>
-            <div class="field">
-              <label for="max-classification">最高密级</label>
-              <select id="max-classification">
-                <option value="">不限制</option>
-                <option value="public">public</option>
-                <option value="internal">internal</option>
-                <option value="confidential">confidential</option>
-                <option value="restricted">restricted</option>
-                <option value="secret" selected>secret</option>
-              </select>
-            </div>
-          </section>
-
-          <section class="auth-section hidden" id="oidc-fields">
-            <div class="field">
-              <label for="bearer-token">Bearer Token</label>
-              <textarea id="bearer-token" rows="5" placeholder="eyJ..."></textarea>
-            </div>
-          </section>
-
-          <button class="primary-button" type="submit">登录</button>
-          <p class="form-status" id="login-status"></p>
-        </form>
+        <div class="gateway-actions">
+          <a class="primary-button link-action" href="./admin-login.html">管理员登录</a>
+          <a class="secondary-button link-action" href="./chat-login.html">用户问答登录</a>
+        </div>
       </section>
     </main>
-    <script src="./auth.js?v=4"></script>
-    <script src="./login.js?v=4"></script>
   </body>
 </html>

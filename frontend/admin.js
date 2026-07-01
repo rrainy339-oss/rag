@@ -1,3 +1,8 @@
+RagAuth.configure({
+  storageKey: RagAuth.ADMIN_STORAGE_KEY,
+  loginPage: "./admin-login.html",
+});
+
 const els = {
   identityLabel: document.querySelector("#identity-label"),
   logoutButton: document.querySelector("#logout-button"),
@@ -33,6 +38,7 @@ const state = {
   me: null,
   documents: [],
   pending: false,
+  refreshTimer: null,
 };
 
 init();
@@ -93,7 +99,7 @@ async function uploadDocument() {
 
   state.pending = true;
   els.uploadButton.disabled = true;
-  setUploadStatus("正在上传，后端会解析、分块、BGE-M3 编码并写入 Qdrant hybrid。");
+  setUploadStatus("正在上传，成功后会创建持久化文档任务，由 worker 执行解析、分块、BGE-M3 编码和 Qdrant 写入。");
 
   const formData = new FormData();
   formData.append("file", file);
@@ -114,7 +120,7 @@ async function uploadDocument() {
     els.uploadForm.reset();
     els.documentClassification.value = "internal";
     renderDocuments();
-    setUploadStatus("上传已受理，后台正在处理。");
+    setUploadStatus("上传已受理，文档任务已入队，等待 worker 处理。");
     scheduleRefresh();
   } catch (error) {
     setUploadStatus(`上传失败：${error.message}`, true);
@@ -163,6 +169,36 @@ async function reindexDocument(documentId) {
   }
 }
 
+async function cancelJob(jobId) {
+  if (!jobId) return;
+  setDocumentsStatus("Cancelling document job...");
+  try {
+    const job = await RagAuth.requestJson(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: "POST",
+    });
+    mergeJob(job);
+    renderDocuments();
+    scheduleRefresh();
+  } catch (error) {
+    setDocumentsStatus(`Cancel failed: ${error.message}`, true);
+  }
+}
+
+async function retryJob(jobId) {
+  if (!jobId) return;
+  setDocumentsStatus("Retrying document job...");
+  try {
+    const job = await RagAuth.requestJson(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {
+      method: "POST",
+    });
+    mergeJob(job);
+    renderDocuments();
+    scheduleRefresh();
+  } catch (error) {
+    setDocumentsStatus(`Retry failed: ${error.message}`, true);
+  }
+}
+
 async function deleteDocument(documentId) {
   const record = state.documents.find((item) => item.document_id === documentId);
   const title = record?.title || record?.filename || documentId;
@@ -184,6 +220,7 @@ async function deleteDocument(documentId) {
 function renderDocuments() {
   els.documentRows.replaceChildren(...state.documents.map(renderDocumentRow));
   els.documentEmpty.classList.toggle("hidden", state.documents.length > 0);
+  scheduleActiveJobRefresh();
 }
 
 function renderDocumentRow(record) {
@@ -203,6 +240,8 @@ function renderDocumentRow(record) {
     error.textContent = record.error_message;
     statusCell.append(error);
   }
+  const jobSummary = renderJobSummary(record.job);
+  if (jobSummary) statusCell.append(jobSummary);
 
   const permissionsCell = document.createElement("td");
   permissionsCell.append(...permissionLabels(record).map(chip));
@@ -221,8 +260,63 @@ function renderDocumentRow(record) {
     actionButton("删除", () => deleteDocument(record.document_id), "danger"),
   );
 
+  for (const button of jobActionButtons(record.job)) {
+    actionsCell.insertBefore(button, actionsCell.lastElementChild);
+  }
+
   row.append(documentCell, statusCell, permissionsCell, indexCell, updatedCell, actionsCell);
   return row;
+}
+
+function renderJobSummary(job) {
+  if (!job) return null;
+  const wrapper = document.createElement("span");
+  wrapper.className = "job-summary";
+
+  const label = document.createElement("span");
+  label.textContent = `job: ${job.job_type || "ingest"} / ${job.status || "queued"} / ${formatJobStage(job.stage)}`;
+
+  const progress = document.createElement("span");
+  progress.className = "job-progress";
+  progress.style.setProperty("--progress", `${Number(job.progress || 0)}%`);
+  progress.setAttribute("aria-label", `${Number(job.progress || 0)}%`);
+
+  wrapper.append(label, progress);
+  if (job.error_message) {
+    const error = document.createElement("span");
+    error.className = "row-error";
+    error.textContent = job.error_message;
+    wrapper.append(error);
+  }
+  return wrapper;
+}
+
+function jobActionButtons(job) {
+  if (!job) return [];
+  const buttons = [];
+  if (canCancelJob(job)) {
+    buttons.push(actionButton("Cancel job", () => cancelJob(job.job_id)));
+  }
+  if (canRetryJob(job)) {
+    buttons.push(actionButton("Retry job", () => retryJob(job.job_id)));
+  }
+  return buttons;
+}
+
+function canCancelJob(job) {
+  return ["queued", "running", "retrying", "cancelling"].includes(job.status);
+}
+
+function canRetryJob(job) {
+  return ["failed", "cancelled"].includes(job.status);
+}
+
+function isActiveJob(job) {
+  return ["queued", "running", "retrying", "cancelling"].includes(job?.status);
+}
+
+function formatJobStage(stage) {
+  return String(stage || "queued").replaceAll("_", " ");
 }
 
 function openEditPanel(record) {
@@ -288,9 +382,30 @@ function upsertDocument(record) {
   }
 }
 
+function mergeJob(job) {
+  const record = state.documents.find((item) => item.document_id === job.document_id);
+  if (record) {
+    record.job = job;
+  }
+}
+
 function scheduleRefresh() {
+  if (state.refreshTimer) {
+    window.clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+  }
   window.setTimeout(loadDocuments, 1400);
   window.setTimeout(loadDocuments, 4200);
+}
+
+function scheduleActiveJobRefresh() {
+  if (state.refreshTimer || !state.documents.some((record) => isActiveJob(record.job))) {
+    return;
+  }
+  state.refreshTimer = window.setTimeout(() => {
+    state.refreshTimer = null;
+    loadDocuments();
+  }, 2600);
 }
 
 function setUploadStatus(text, isError) {
@@ -317,9 +432,9 @@ function formatDate(value) {
 
 function logout() {
   RagAuth.clearSession();
-  window.location.href = "./login.html";
+  window.location.href = "./admin-login.html";
 }
 
 function renderAccessDenied() {
-  document.body.innerHTML = '<main class="login-shell"><section class="login-panel"><h1>无权访问文档管理</h1><a class="primary-button link-action" href="./login.html">重新登录</a></section></main>';
+  document.body.innerHTML = '<main class="login-shell"><section class="login-panel"><h1>无权访问文档管理</h1><a class="primary-button link-action" href="./admin-login.html">重新登录</a></section></main>';
 }

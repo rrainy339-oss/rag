@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.documents.schemas import DocumentRecord
+from app.documents.schemas import DocumentJob, DocumentRecord
 
 
 class RetrievalRequest(BaseModel):
@@ -105,6 +105,11 @@ class ModelListResponse(BaseModel):
     request_id: str
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
 class PrincipalResponse(BaseModel):
     subject: str
     tenant_id: str | None = None
@@ -121,8 +126,26 @@ class PrincipalResponse(BaseModel):
     request_id: str
 
 
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    principal: PrincipalResponse
+    request_id: str
+
+
+class DocumentJobResponse(DocumentJob):
+    request_id: str | None = None
+
+
+class DocumentJobListResponse(BaseModel):
+    jobs: list[DocumentJobResponse]
+    request_id: str
+
+
 class DocumentResponse(DocumentRecord):
     request_id: str | None = None
+    job: DocumentJobResponse | None = None
 
 
 class DocumentListResponse(BaseModel):
