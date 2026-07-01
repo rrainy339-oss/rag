@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>文档管理 - Enterprise RAG</title>
+    <link rel="stylesheet" href="./styles.css?v=4" />
+  </head>
+  <body>
+    <div class="admin-shell">
+      <header class="admin-topbar">
+        <div class="brand-row">
+          <span class="brand-mark">R</span>
+          <div>
+            <strong>文档管理</strong>
+            <span id="identity-label">正在验证身份</span>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <a class="secondary-button compact-button" href="./chat.html">问答页面</a>
+          <button class="secondary-button compact-button" id="logout-button" type="button">退出</button>
+        </div>
+      </header>
+
+      <main class="admin-main">
+        <section class="admin-upload">
+          <div class="section-head">
+            <div>
+              <h1>上传入库</h1>
+              <p>管理员上传文档，并在入库前指定租户、用户组、用户和密级。</p>
+            </div>
+          </div>
+          <form class="admin-form" id="upload-form">
+            <div class="field">
+              <label for="document-file">文件</label>
+              <input id="document-file" type="file" required />
+            </div>
+            <div class="field">
+              <label for="document-title">标题</label>
+              <input id="document-title" type="text" placeholder="默认使用文件名" />
+            </div>
+            <div class="field-grid">
+              <div class="field">
+                <label for="document-tenant">租户</label>
+                <input id="document-tenant" type="text" placeholder="tenant-a" />
+              </div>
+              <div class="field">
+                <label for="document-owner">所有者</label>
+                <input id="document-owner" type="text" placeholder="admin-a" />
+              </div>
+            </div>
+            <div class="field">
+              <label for="document-groups">允许用户组</label>
+              <input id="document-groups" type="text" placeholder="legal, finance" />
+            </div>
+            <div class="field">
+              <label for="document-principals">允许用户 ID</label>
+              <input id="document-principals" type="text" placeholder="user-001, user-002" />
+            </div>
+            <div class="field">
+              <label for="document-classification">密级</label>
+              <select id="document-classification">
+                <option value="public">public</option>
+                <option value="internal" selected>internal</option>
+                <option value="confidential">confidential</option>
+                <option value="restricted">restricted</option>
+                <option value="secret">secret</option>
+              </select>
+            </div>
+            <button class="primary-button" id="upload-button" type="submit">上传并开始解析索引</button>
+            <p class="form-status" id="upload-status"></p>
+          </form>
+        </section>
+
+        <section class="admin-documents">
+          <div class="section-head">
+            <div>
+              <h1>已上传文档</h1>
+              <p>查看处理状态，修改权限，重建索引或删除文档。</p>
+            </div>
+            <button class="secondary-button compact-button" id="refresh-documents" type="button">刷新</button>
+          </div>
+          <div class="table-wrap">
+            <table class="document-table">
+              <thead>
+                <tr>
+                  <th>文档</th>
+                  <th>状态</th>
+                  <th>权限</th>
+                  <th>索引</th>
+                  <th>更新时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="document-rows"></tbody>
+            </table>
+            <div class="table-empty" id="document-empty">暂无文档</div>
+          </div>
+          <p class="form-status" id="documents-status"></p>
+        </section>
+      </main>
+
+      <aside class="edit-panel" id="edit-panel" aria-label="编辑文档权限">
+        <div class="settings-head">
+          <h2 id="edit-title">编辑权限</h2>
+          <button class="icon-button" id="close-edit" type="button" title="关闭" aria-label="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+        <form class="admin-form" id="permission-form">
+          <input id="permission-document-id" type="hidden" />
+          <div class="field">
+            <label for="permission-tenant">租户</label>
+            <input id="permission-tenant" type="text" />
+          </div>
+          <div class="field">
+            <label for="permission-owner">所有者</label>
+            <input id="permission-owner" type="text" />
+          </div>
+          <div class="field">
+            <label for="permission-groups">允许用户组</label>
+            <input id="permission-groups" type="text" />
+          </div>
+          <div class="field">
+            <label for="permission-principals">允许用户 ID</label>
+            <input id="permission-principals" type="text" />
+          </div>
+          <div class="field">
+            <label for="permission-classification">密级</label>
+            <select id="permission-classification">
+              <option value="">未设置</option>
+              <option value="public">public</option>
+              <option value="internal">internal</option>
+              <option value="confidential">confidential</option>
+              <option value="restricted">restricted</option>
+              <option value="secret">secret</option>
+            </select>
+          </div>
+          <button class="primary-button" type="submit">保存权限</button>
+          <p class="form-status" id="permission-status"></p>
+        </form>
+      </aside>
+    </div>
+
+    <div class="backdrop" id="backdrop"></div>
+    <script src="./auth.js?v=4"></script>
+    <script src="./admin.js?v=4"></script>
+  </body>
+</html>

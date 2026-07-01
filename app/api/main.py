@@ -18,6 +18,7 @@ from app.api.schemas import (
     HealthResponse,
     ModelListRequest,
     ModelListResponse,
+    PrincipalResponse,
     RetrievalAPIResponse,
     RetrievalRequest,
 )
@@ -120,6 +121,28 @@ def healthz() -> HealthResponse:
         backend=settings.backend,
         llm_provider=settings.llm_provider,
         auth_mode=security_settings.auth_mode,
+    )
+
+
+@app.get("/api/me", response_model=PrincipalResponse)
+def me(
+    request: Request,
+    principal: Principal = Depends(get_current_principal),
+) -> PrincipalResponse:
+    return PrincipalResponse(
+        subject=principal.subject,
+        tenant_id=principal.tenant_id,
+        user_id=principal.user_id,
+        email=principal.email,
+        group_ids=principal.group_ids,
+        roles=principal.roles,
+        scopes=principal.scopes,
+        max_classification=principal.max_classification,
+        auth_mode=principal.auth_mode,
+        enforce_permissions=principal.enforce_permissions,
+        can_chat=_has_scope(principal, "rag:chat"),
+        can_manage_documents=_has_scope(principal, "rag:documents"),
+        request_id=request.state.request_id,
     )
 
 
@@ -403,6 +426,14 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ValueError):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=500, detail=str(exc))
+
+
+def _has_scope(principal: Principal, scope: str) -> bool:
+    return (
+        not principal.enforce_permissions
+        or scope in principal.scopes
+        or "rag:admin" in principal.scopes
+    )
 
 
 def _to_document_response(

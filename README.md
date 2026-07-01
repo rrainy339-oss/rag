@@ -92,6 +92,7 @@ The runtime only supports `qdrant_hybrid` and `bge-m3`; those are the defaults.
 ## API Endpoints
 
 - `GET /healthz`
+- `GET /api/me`
 - `POST /api/retrieve`
 - `POST /api/chat`
 - `POST /api/models`
@@ -120,21 +121,28 @@ permission filtering.
 
 ## Frontend Test Flow
 
-Open the frontend:
+Open the login page:
 
 ```text
-D:\codex project\my rag\frontend\index.html
+D:\codex project\my rag\frontend\login.html
 ```
 
-In settings, use:
+Use `Dev Header` mode for local testing. For an administrator account, keep or
+enter scopes like:
 
 ```text
-API URL: http://localhost:8000/api/chat
+rag:chat,rag:retrieve,rag:models,rag:documents
 ```
 
-Open the document panel, choose a file, fill the access fields, and click upload.
-The document list will refresh through parsing/chunking/indexing until the status
-is `ready`.
+After login:
+
+- `admin.html`: administrator document management. Upload documents, set access
+  fields, edit existing document permissions, reindex, and delete documents.
+- `chat.html`: user-facing Q&A. The page only sends chat/model requests; document
+  management is kept out of the Q&A surface.
+
+Document uploads refresh through parsing/chunking/indexing until the status is
+`ready`.
 
 Verify Qdrant:
 

@@ -71,6 +71,43 @@ class FastAPIAppTest(unittest.TestCase):
         self.assertEqual(payload["request_id"], "models-test")
         self.assertEqual(payload["models"], ["llama3.1"])
 
+    def test_me_endpoint_returns_principal_capabilities(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from app.api import main as api_main
+        from app.security import SecuritySettings
+
+        api_main.security_settings = SecuritySettings(auth_mode="dev")
+        api_main.audit_logger = api_main.AuditLogger.from_settings(
+            api_main.security_settings
+        )
+        client = TestClient(api_main.app)
+        response = client.get(
+            "/api/me",
+            headers={
+                "x-request-id": "me-test",
+                "x-rag-subject": "admin-a",
+                "x-rag-tenant-id": "tenant-a",
+                "x-rag-user-id": "admin-a",
+                "x-rag-group-ids": "admin,legal",
+                "x-rag-scopes": "rag:chat,rag:documents",
+                "x-rag-max-classification": "secret",
+            },
+        )
+        api_main.security_settings = SecuritySettings(auth_mode="disabled")
+        api_main.audit_logger = api_main.AuditLogger.from_settings(
+            api_main.security_settings
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["request_id"], "me-test")
+        self.assertEqual(payload["subject"], "admin-a")
+        self.assertEqual(payload["tenant_id"], "tenant-a")
+        self.assertEqual(payload["group_ids"], ["admin", "legal"])
+        self.assertTrue(payload["can_chat"])
+        self.assertTrue(payload["can_manage_documents"])
+
     def test_document_upload_accepts_permission_fields(self) -> None:
         from fastapi.testclient import TestClient
 

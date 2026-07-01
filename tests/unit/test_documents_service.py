@@ -83,6 +83,129 @@ class DocumentServiceTest(unittest.TestCase):
         self.assertEqual(collection.manifest.metadata["sparse_vector_name"], "sparse")
         self.assertEqual(collection.indexed_count, indexing_result.indexed_count)
 
+    def test_delete_document_removes_qdrant_points_before_marking_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: vector_store
+            )
+
+            record = _record(root)
+            service.registry.create(record)
+            chunking_result = _sample_chunks(record.document_id)
+            chunks_path = root / "chunks.json"
+            chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+            indexing_result, index_path = service._index_document(record, chunking_result)
+            service.registry.update_artifacts(
+                record.document_id,
+                chunks_path=chunks_path,
+                index_path=index_path,
+                chunk_count=len(chunking_result.chunks),
+                indexed_count=indexing_result.indexed_count,
+                status=DocumentStatus.READY,
+            )
+
+            indexed_count_before_delete = vector_store.count()
+            deleted = service.delete_document(record.document_id)
+            indexed_count_after_delete = vector_store.count()
+            collection = IndexingResult.model_validate_json(
+                settings.documents_collection_index_path.read_text(encoding="utf-8")
+            )
+
+        self.assertGreater(indexed_count_before_delete, 0)
+        self.assertEqual(indexed_count_after_delete, 0)
+        self.assertEqual(deleted.status, DocumentStatus.DELETED)
+        self.assertEqual(collection.indexed_count, 0)
+
+    def test_delete_document_keeps_record_ready_when_qdrant_delete_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: vector_store
+            )
+
+            record = _record(root)
+            service.registry.create(record)
+            chunking_result = _sample_chunks(record.document_id)
+            chunks_path = root / "chunks.json"
+            chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+            indexing_result, index_path = service._index_document(record, chunking_result)
+            service.registry.update_artifacts(
+                record.document_id,
+                chunks_path=chunks_path,
+                index_path=index_path,
+                chunk_count=len(chunking_result.chunks),
+                indexed_count=indexing_result.indexed_count,
+                status=DocumentStatus.READY,
+            )
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: FailingDeleteVectorStore()
+            )
+
+            with self.assertRaises(RuntimeError):
+                service.delete_document(record.document_id)
+
+            current = service.registry.get(record.document_id)
+
+        self.assertIsNotNone(current)
+        self.assertEqual(current.status, DocumentStatus.READY)
+
+    def test_update_permissions_rewrites_qdrant_payloads_for_ready_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: vector_store
+            )
+
+            record = _record(root)
+            service.registry.create(record)
+            chunking_result = _sample_chunks(record.document_id)
+            chunks_path = root / "chunks.json"
+            chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+            indexing_result, index_path = service._index_document(record, chunking_result)
+            service.registry.update_artifacts(
+                record.document_id,
+                chunks_path=chunks_path,
+                index_path=index_path,
+                chunk_count=len(chunking_result.chunks),
+                indexed_count=indexing_result.indexed_count,
+                status=DocumentStatus.READY,
+            )
+
+            updated = service.update_permissions(
+                record.document_id,
+                tenant_id="tenant-b",
+                owner_id="owner-2",
+                group_ids=["finance"],
+                principal_ids=["user-2"],
+                classification="secret",
+            )
+            synced_record = vector_store.records[0]
+
+        self.assertEqual(updated.tenant_id, "tenant-b")
+        self.assertEqual(synced_record.access.tenant_id, "tenant-b")
+        self.assertEqual(synced_record.access.allowed_group_ids, ["finance"])
+        self.assertEqual(synced_record.access.allowed_user_ids, ["user-2"])
+        self.assertEqual(synced_record.metadata["tenant_id"], "tenant-b")
+        self.assertEqual(synced_record.metadata["allowed_group_ids"], ["finance"])
+        self.assertEqual(synced_record.metadata["allowed_user_ids"], ["user-2"])
+        self.assertEqual(synced_record.metadata["classification"], "secret")
+
 
 def _document_settings(root: Path) -> APISettings:
     return APISettings(
@@ -120,6 +243,11 @@ def _sample_chunks(document_id: str):
     for chunk in chunking_result.chunks:
         chunk.document_id = document_id
     return chunking_result
+
+
+class FailingDeleteVectorStore(CapturingHybridVectorStore):
+    def delete_by_document(self, document_id: str) -> int:
+        raise RuntimeError(f"delete failed for {document_id}")
 
 
 if __name__ == "__main__":

@@ -148,7 +148,8 @@ class DocumentService:
         return self.process_document(document_id)
 
     def delete_document(self, document_id: str) -> DocumentRecord:
-        self._require_document(document_id)
+        existing = self._require_document(document_id)
+        self._delete_index_records(existing)
         record = self.registry.update_status(document_id, DocumentStatus.DELETED)
         self.rebuild_collection()
         self._notify_collection_updated()
@@ -174,7 +175,9 @@ class DocumentService:
             classification=_clean(classification),
         )
         if existing.status == DocumentStatus.READY:
-            self._rewrite_access(record)
+            indexing_result = self._rewrite_access(record)
+            if indexing_result is not None:
+                self._upsert_index_records(indexing_result)
             self.rebuild_collection()
             self._notify_collection_updated()
         return record
@@ -328,13 +331,56 @@ class DocumentService:
     def _configured_embedding_dimension(self) -> int:
         return BGEM3EmbeddingProvider.dimension
 
-    def _rewrite_access(self, record: DocumentRecord) -> None:
-        if not record.chunks_path or not record.index_path:
+    def _delete_index_records(self, record: DocumentRecord) -> int:
+        if not _may_have_index_records(record):
+            return 0
+
+        vector_store = None
+        try:
+            vector_store = self._build_vector_store(
+                embedding_dimension=self._record_embedding_dimension(record),
+            )
+            return int(vector_store.delete_by_document(record.document_id) or 0)
+        finally:
+            close = getattr(vector_store, "close", None)
+            if callable(close):
+                close()
+
+    def _record_embedding_dimension(self, record: DocumentRecord) -> int:
+        if record.index_path:
+            index_path = Path(record.index_path)
+            if index_path.exists():
+                try:
+                    indexing_result = IndexingResult.model_validate_json(
+                        index_path.read_text(encoding="utf-8")
+                    )
+                    return indexing_result.manifest.embedding_dimension
+                except Exception:
+                    pass
+        return self._configured_embedding_dimension()
+
+    def _upsert_index_records(self, indexing_result: IndexingResult) -> None:
+        if not indexing_result.records:
             return
+
+        vector_store = None
+        try:
+            vector_store = self._build_vector_store(
+                embedding_dimension=indexing_result.manifest.embedding_dimension,
+            )
+            vector_store.upsert(indexing_result.records)
+        finally:
+            close = getattr(vector_store, "close", None)
+            if callable(close):
+                close()
+
+    def _rewrite_access(self, record: DocumentRecord) -> IndexingResult | None:
+        if not record.chunks_path or not record.index_path:
+            return None
         chunks_path = Path(record.chunks_path)
         index_path = Path(record.index_path)
         if not chunks_path.exists() or not index_path.exists():
-            return
+            return None
 
         chunking_result = ChunkingResult.model_validate_json(
             chunks_path.read_text(encoding="utf-8")
@@ -350,6 +396,7 @@ class DocumentService:
             datetime.now(timezone.utc).isoformat()
         )
         index_path.write_text(indexing_result.to_json(), encoding="utf-8")
+        return indexing_result
 
     def _document_dir(self, document_id: str) -> Path:
         return self.settings.documents_storage_dir / document_id
@@ -546,6 +593,14 @@ def _enrich_index_records(indexing_result: IndexingResult, record: DocumentRecor
         index_record.access = access
         index_record.metadata.update(metadata)
         index_record.metadata["document_id"] = record.document_id
+
+
+def _may_have_index_records(record: DocumentRecord) -> bool:
+    return (
+        record.status in {DocumentStatus.READY, DocumentStatus.INDEXING}
+        or bool(record.index_path)
+        or record.indexed_count > 0
+    )
 
 
 def _document_metadata(record: DocumentRecord) -> dict[str, object | None]:

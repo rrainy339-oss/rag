@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>问答 - Enterprise RAG</title>
+    <link rel="stylesheet" href="./styles.css?v=4" />
+  </head>
+  <body>
+    <div class="chat-shell">
+      <aside class="sidebar" id="sidebar" aria-label="会话列表">
+        <div class="sidebar-head">
+          <div class="brand-row compact">
+            <span class="brand-mark">R</span>
+            <div>
+              <strong>RAG 问答</strong>
+              <span id="identity-label">未登录</span>
+            </div>
+          </div>
+          <button class="icon-button" id="new-chat" type="button" title="新建会话" aria-label="新建会话">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          </button>
+        </div>
+        <div class="search-wrap">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 21-4.3-4.3M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" /></svg>
+          <input id="session-search" type="search" placeholder="搜索会话" />
+        </div>
+        <nav class="session-list" id="session-list" aria-label="历史会话"></nav>
+      </aside>
+
+      <main class="chat-main">
+        <header class="topbar">
+          <button class="icon-button mobile-only" id="toggle-sidebar" type="button" title="会话" aria-label="会话">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+          </button>
+          <div class="page-title">
+            <strong id="active-title">新会话</strong>
+            <span id="active-subtitle">Hybrid Retrieval</span>
+          </div>
+          <div class="topbar-actions">
+            <a class="secondary-button compact-button hidden" id="admin-link" href="./admin.html">文档管理</a>
+            <button class="icon-button" id="toggle-settings" type="button" title="设置" aria-label="设置">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.3a2 2 0 1 1-4 0V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 1 1 4.2 17l.1-.1A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.6-1H2.7a2 2 0 1 1 0-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7A2 2 0 1 1 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.3a2 2 0 1 1 4 0V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 1 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.3a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.6 1Z" /></svg>
+            </button>
+            <button class="secondary-button compact-button" id="logout-button" type="button">退出</button>
+          </div>
+        </header>
+
+        <section class="message-scroll" id="message-scroll" aria-live="polite">
+          <div class="empty-state" id="empty-state">
+            <h1>向知识库提问</h1>
+          </div>
+          <div class="messages" id="messages"></div>
+        </section>
+
+        <section class="composer-wrap">
+          <form class="composer" id="composer">
+            <textarea id="prompt-input" rows="1" placeholder="输入问题，后端会按你的权限检索可访问文档"></textarea>
+            <button class="send-button" id="send-button" type="submit" title="发送" aria-label="发送">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
+            </button>
+          </form>
+        </section>
+      </main>
+
+      <aside class="settings-panel" id="settings-panel" aria-label="问答设置">
+        <div class="settings-head">
+          <h2>问答设置</h2>
+          <button class="icon-button" id="close-settings" type="button" title="关闭" aria-label="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+
+        <div class="field">
+          <label for="mode-select">响应模式</label>
+          <select id="mode-select">
+            <option value="api" selected>后端 RAG API</option>
+            <option value="mock">前端模拟</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="llm-provider">模型接入</label>
+          <select id="llm-provider">
+            <option value="ollama">Ollama 本地</option>
+            <option value="openai-compatible">OpenAI 兼容 API</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="llm-base-url">Base URL</label>
+          <input id="llm-base-url" type="url" value="http://localhost:11434" />
+        </div>
+        <div class="field hidden" id="llm-api-key-field">
+          <label for="llm-api-key">API Key</label>
+          <input id="llm-api-key" type="password" autocomplete="off" placeholder="sk-..." />
+        </div>
+        <div class="field">
+          <label for="model-name">模型</label>
+          <div class="model-picker">
+            <input id="model-name" type="text" list="model-options" value="llama3.1" />
+            <button class="secondary-button" id="refresh-models" type="button">获取模型</button>
+          </div>
+          <datalist id="model-options"></datalist>
+          <small id="models-status"></small>
+        </div>
+        <div class="field-grid compact-grid">
+          <div class="field">
+            <label for="top-k">Top K</label>
+            <input id="top-k" type="number" min="1" max="20" value="5" />
+          </div>
+          <div class="field">
+            <label for="temperature">温度</label>
+            <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.1" />
+          </div>
+        </div>
+        <div class="switch-field">
+          <span>显示引用</span>
+          <label class="switch">
+            <input id="show-citations" type="checkbox" checked />
+            <span></span>
+          </label>
+        </div>
+      </aside>
+    </div>
+
+    <div class="backdrop" id="backdrop"></div>
+    <script src="./auth.js?v=4"></script>
+    <script src="./chat.js?v=4"></script>
+  </body>
+</html>

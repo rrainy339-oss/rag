@@ -105,6 +105,22 @@ class ModelListResponse(BaseModel):
     request_id: str
 
 
+class PrincipalResponse(BaseModel):
+    subject: str
+    tenant_id: str | None = None
+    user_id: str | None = None
+    email: str | None = None
+    group_ids: list[str] = Field(default_factory=list)
+    roles: list[str] = Field(default_factory=list)
+    scopes: list[str] = Field(default_factory=list)
+    max_classification: str | None = None
+    auth_mode: str
+    enforce_permissions: bool
+    can_chat: bool
+    can_manage_documents: bool
+    request_id: str
+
+
 class DocumentResponse(DocumentRecord):
     request_id: str | None = None
 
