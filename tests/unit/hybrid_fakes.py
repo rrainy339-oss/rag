@@ -47,6 +47,8 @@ class CapturingHybridVectorStore:
     def __init__(self, records: list[IndexRecord] | None = None) -> None:
         self.records = list(records or [])
         self.closed = False
+        self.upsert_calls = 0
+        self.set_payload_calls = 0
 
     def delete_by_document(self, document_id: str) -> int:
         before = len(self.records)
@@ -56,10 +58,30 @@ class CapturingHybridVectorStore:
         return before - len(self.records)
 
     def upsert(self, records: list[IndexRecord]) -> None:
+        self.upsert_calls += 1
         existing = {record.record_id: record for record in self.records}
         for record in records:
             existing[record.record_id] = record
         self.records = list(existing.values())
+
+    def set_payload(self, records: list[IndexRecord]) -> int:
+        self.set_payload_calls += 1
+        existing = {record.record_id: record for record in self.records}
+        updated_count = 0
+        for record in records:
+            current = existing.get(record.record_id)
+            if current is None:
+                continue
+            existing[record.record_id] = current.model_copy(
+                update={
+                    "metadata": record.metadata,
+                    "access": record.access,
+                    "document_id": record.document_id,
+                }
+            )
+            updated_count += 1
+        self.records = list(existing.values())
+        return updated_count
 
     def count(self) -> int:
         return len(self.records)

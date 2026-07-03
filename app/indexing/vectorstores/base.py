@@ -19,6 +19,9 @@ class HybridVectorStore(Protocol):
     def upsert(self, records: list[IndexRecord]) -> None:
         """Insert or replace index records."""
 
+    def set_payload(self, records: list[IndexRecord]) -> int:
+        """Update payload fields for existing records without rewriting vectors."""
+
     def delete_by_document(self, document_id: str) -> int:
         """Delete all records for one document and return deleted count."""
 

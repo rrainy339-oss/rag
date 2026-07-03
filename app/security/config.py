@@ -32,6 +32,8 @@ class SecuritySettings(BaseModel):
     jwt_issuer: str = "enterprise-rag"
     jwt_audience: str = "enterprise-rag-api"
     jwt_expire_minutes: int = Field(default=480, ge=1)
+    auth_db_path: Path = Path("artifacts/security/auth.sqlite3")
+    auth_seed_default_users: bool = True
 
     jwt_admin_username: str = "admin"
     jwt_admin_password: str = "admin123"
@@ -100,6 +102,11 @@ class SecuritySettings(BaseModel):
             jwt_issuer=_str("RAG_JWT_ISSUER", "enterprise-rag"),
             jwt_audience=_str("RAG_JWT_AUDIENCE", "enterprise-rag-api"),
             jwt_expire_minutes=_int("RAG_JWT_EXPIRE_MINUTES", 480),
+            auth_db_path=_path(
+                "RAG_AUTH_DB_PATH",
+                cls.model_fields["auth_db_path"].default,
+            ),
+            auth_seed_default_users=_bool("RAG_AUTH_SEED_DEFAULT_USERS", True),
             jwt_admin_username=_str("RAG_JWT_ADMIN_USERNAME", "admin"),
             jwt_admin_password=_str("RAG_JWT_ADMIN_PASSWORD", "admin123"),
             jwt_admin_subject=_str("RAG_JWT_ADMIN_SUBJECT", "admin"),
@@ -179,6 +186,11 @@ def _csv(name: str, default: list[str]) -> list[str]:
     if value is None or value.strip() == "":
         return list(default)
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _path(name: str, default: object) -> Path:
+    value = os.getenv(name)
+    return Path(value) if value else Path(default)
 
 
 def _optional_path(name: str) -> Path | None:

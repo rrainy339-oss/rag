@@ -63,7 +63,7 @@ class QdrantHybridVectorStore:
 
         points = [
             self._models.PointStruct(
-                id=str(uuid5(NAMESPACE_URL, record.record_id)),
+                id=_record_point_id(record),
                 vector={
                     self.dense_vector_name: record.vector,
                     self.sparse_vector_name: self._models.SparseVector(
@@ -80,6 +80,18 @@ class QdrantHybridVectorStore:
             points=points,
             wait=True,
         )
+
+    def set_payload(self, records: list[IndexRecord]) -> int:
+        updated_count = 0
+        for record in records:
+            self.client.set_payload(
+                collection_name=self.collection_name,
+                payload=_record_payload(record),
+                points=[_record_point_id(record)],
+                wait=True,
+            )
+            updated_count += 1
+        return updated_count
 
     def delete_by_document(self, document_id: str) -> int:
         query_filter = self._filter_for_document(document_id)
@@ -214,6 +226,10 @@ def _record_payload(record: IndexRecord) -> dict[str, Any]:
         "access": record.access.model_dump(mode="json"),
         "citations": [citation.model_dump(mode="json") for citation in record.citations],
     }
+
+
+def _record_point_id(record: IndexRecord) -> str:
+    return str(uuid5(NAMESPACE_URL, record.record_id))
 
 
 def _record_from_point(

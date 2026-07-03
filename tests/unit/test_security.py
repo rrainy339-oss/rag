@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from app.security import AuthError, SecuritySettings, authenticate_request, require_scope
+from app.security import AuthError, AuthService, SecuritySettings, authenticate_request, require_scope
 from app.security.jwt import encode_jwt
+from app.security.passwords import hash_password, verify_password
+from app.security.users import AuthUserStore, SeedAuthUser
 
 
 class SecurityTest(unittest.TestCase):
@@ -96,6 +100,78 @@ class SecurityTest(unittest.TestCase):
             )
 
         self.assertEqual(error.exception.status_code, 401)
+
+    def test_password_hash_verification(self) -> None:
+        password_hash = hash_password("secret-pass")
+
+        self.assertTrue(verify_password("secret-pass", password_hash))
+        self.assertFalse(verify_password("wrong-pass", password_hash))
+
+    def test_auth_service_authenticates_database_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = SecuritySettings(
+                auth_mode="jwt",
+                auth_db_path=Path(temp_dir) / "auth.sqlite3",
+                auth_seed_default_users=False,
+            )
+            store = AuthUserStore(settings.auth_db_path)
+            store.seed_defaults(
+                [
+                    SeedAuthUser(
+                        user_id="admin-db",
+                        username="admin-db",
+                        password="db-pass",
+                        tenant_id="tenant-db",
+                        email="admin@example.com",
+                        group_ids=["admin", "legal"],
+                        roles=["document_manager"],
+                        scopes=["rag:chat", "rag:documents"],
+                        max_classification="secret",
+                    )
+                ]
+            )
+            auth_service = AuthService(settings, store=store)
+
+            principal = auth_service.authenticate_login(
+                "admin-db",
+                "db-pass",
+                login_type="admin",
+            )
+
+        self.assertEqual(principal.subject, "admin-db")
+        self.assertEqual(principal.tenant_id, "tenant-db")
+        self.assertEqual(principal.email, "admin@example.com")
+        self.assertEqual(principal.group_ids, ["admin", "legal"])
+        self.assertIn("rag:documents", principal.scopes)
+
+    def test_auth_service_rejects_chat_only_user_for_admin_frontend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = SecuritySettings(
+                auth_mode="jwt",
+                auth_db_path=Path(temp_dir) / "auth.sqlite3",
+                auth_seed_default_users=False,
+            )
+            store = AuthUserStore(settings.auth_db_path)
+            store.seed_defaults(
+                [
+                    SeedAuthUser(
+                        user_id="chat-db",
+                        username="chat-db",
+                        password="db-pass",
+                        scopes=["rag:chat", "rag:retrieve"],
+                    )
+                ]
+            )
+            auth_service = AuthService(settings, store=store)
+
+            with self.assertRaises(AuthError) as error:
+                auth_service.authenticate_login(
+                    "chat-db",
+                    "db-pass",
+                    login_type="admin",
+                )
+
+        self.assertEqual(error.exception.status_code, 403)
 
 
 def _request(headers: dict[str, str] | None = None) -> Request:

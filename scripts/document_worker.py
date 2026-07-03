@@ -63,6 +63,15 @@ def main(argv: list[str] | None = None) -> int:
             ),
             flush=True,
         )
+        if job.error_message:
+            print(
+                "job {job_id} error:\n{error}".format(
+                    job_id=job.job_id,
+                    error=job.error_message,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         if args.once:
             return 0 if job.error_message is None else 1
 

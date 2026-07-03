@@ -186,6 +186,10 @@ class DocumentServiceTest(unittest.TestCase):
                 indexed_count=indexing_result.indexed_count,
                 status=DocumentStatus.READY,
             )
+            vector_before = list(vector_store.records[0].vector)
+            sparse_indices_before = list(vector_store.records[0].sparse_vector_indices)
+            sparse_values_before = list(vector_store.records[0].sparse_vector_values)
+            upsert_calls_before = vector_store.upsert_calls
 
             updated = service.update_permissions(
                 record.document_id,
@@ -196,8 +200,16 @@ class DocumentServiceTest(unittest.TestCase):
                 classification="secret",
             )
             synced_record = vector_store.records[0]
+            local_index = IndexingResult.model_validate_json(
+                index_path.read_text(encoding="utf-8")
+            )
 
         self.assertEqual(updated.tenant_id, "tenant-b")
+        self.assertEqual(vector_store.upsert_calls, upsert_calls_before)
+        self.assertEqual(vector_store.set_payload_calls, 1)
+        self.assertEqual(synced_record.vector, vector_before)
+        self.assertEqual(synced_record.sparse_vector_indices, sparse_indices_before)
+        self.assertEqual(synced_record.sparse_vector_values, sparse_values_before)
         self.assertEqual(synced_record.access.tenant_id, "tenant-b")
         self.assertEqual(synced_record.access.allowed_group_ids, ["finance"])
         self.assertEqual(synced_record.access.allowed_user_ids, ["user-2"])
@@ -205,6 +217,8 @@ class DocumentServiceTest(unittest.TestCase):
         self.assertEqual(synced_record.metadata["allowed_group_ids"], ["finance"])
         self.assertEqual(synced_record.metadata["allowed_user_ids"], ["user-2"])
         self.assertEqual(synced_record.metadata["classification"], "secret")
+        self.assertEqual(local_index.records[0].access.tenant_id, "tenant-b")
+        self.assertEqual(local_index.records[0].metadata["tenant_id"], "tenant-b")
 
     def test_document_job_runs_successfully_from_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -237,6 +251,48 @@ class DocumentServiceTest(unittest.TestCase):
         self.assertEqual(called["job_id"], queued.job_id)
         self.assertTrue(called["raise_errors"])
 
+    def test_process_document_resumes_from_existing_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: vector_store
+            )
+
+            record = _record(root)
+            service.registry.create(record)
+            chunking_result = _sample_chunks(record.document_id)
+            chunks_path = root / "chunks.json"
+            chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+            service.registry.update_artifacts(
+                record.document_id,
+                chunks_path=chunks_path,
+                chunk_count=len(chunking_result.chunks),
+                status=DocumentStatus.FAILED,
+                error_message="previous indexing failure",
+            )
+
+            def fail_parse(record: DocumentRecord) -> object:
+                del record
+                raise AssertionError("parse should not run when chunks exist")
+
+            def fail_chunk(record: DocumentRecord, parsed_document: object) -> object:
+                del record, parsed_document
+                raise AssertionError("chunking should not run when chunks exist")
+
+            service._parse_document = fail_parse  # type: ignore[method-assign]
+            service._chunk_document = fail_chunk  # type: ignore[method-assign]
+
+            completed = service.process_document(record.document_id, raise_errors=True)
+
+        self.assertEqual(completed.status, DocumentStatus.READY)
+        self.assertGreater(vector_store.count(), 0)
+        self.assertIsNotNone(completed.index_path)
+
     def test_document_job_failure_respects_max_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -261,7 +317,8 @@ class DocumentServiceTest(unittest.TestCase):
         self.assertIsNotNone(failed)
         self.assertEqual(failed.status, DocumentJobStatus.FAILED)
         self.assertEqual(failed.attempt, 1)
-        self.assertEqual(failed.error_message, "boom")
+        self.assertIn("Traceback", failed.error_message or "")
+        self.assertIn("RuntimeError: boom", failed.error_message or "")
 
     def test_cancelled_queued_document_job_is_not_claimed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

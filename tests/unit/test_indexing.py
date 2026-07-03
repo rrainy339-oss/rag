@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from app.domain.schemas import AccessControl
 from app.indexing.config import IndexingConfig
 from app.indexing.embeddings.bge import _lexical_weights_to_sparse_vector
 from app.indexing.indexer import EnterpriseIndexer
@@ -150,6 +151,57 @@ class IndexingPipelineTest(unittest.TestCase):
                     [item.record.record_id for item in filtered],
                     ["idx-hybrid-alpha"],
                 )
+
+                updated_metadata = {
+                    **records[0].metadata,
+                    "tenant_id": "tenant-b",
+                    "allowed_group_ids": ["finance"],
+                    "principal_ids": ["group:tenant-b:finance"],
+                    "classification": "secret",
+                    "classification_level": 4,
+                }
+                updated_record = records[0].model_copy(
+                    update={
+                        "metadata": updated_metadata,
+                        "access": AccessControl(
+                            tenant_id="tenant-b",
+                            allowed_group_ids=["finance"],
+                            classification="secret",
+                        ),
+                    }
+                )
+                self.assertEqual(vector_store.set_payload([updated_record]), 1)
+
+                old_acl = vector_store.hybrid_search(
+                    dense_vector=[1.0, 0.0, 0.0],
+                    sparse_indices=[11],
+                    sparse_values=[1.0],
+                    top_k=2,
+                    dense_top_k=2,
+                    sparse_top_k=2,
+                    filters={
+                        "principal_ids_any": ["group:tenant-a:hr"],
+                        "classification_level_lte": 1,
+                    },
+                )
+                new_acl = vector_store.hybrid_search(
+                    dense_vector=[1.0, 0.0, 0.0],
+                    sparse_indices=[11],
+                    sparse_values=[1.0],
+                    top_k=2,
+                    dense_top_k=2,
+                    sparse_top_k=2,
+                    filters={
+                        "principal_ids_any": ["group:tenant-b:finance"],
+                        "classification_level_lte": 4,
+                    },
+                )
+                self.assertEqual(old_acl, [])
+                self.assertEqual(
+                    [item.record.record_id for item in new_acl],
+                    ["idx-hybrid-alpha"],
+                )
+                self.assertEqual(new_acl[0].record.access.tenant_id, "tenant-b")
             finally:
                 vector_store.close()
 

@@ -185,7 +185,7 @@ class DocumentJobRegistry:
                 UPDATE document_jobs
                 SET status = ?, attempt = attempt + 1, locked_by = ?,
                     locked_at = ?, heartbeat_at = ?, started_at = ?,
-                    updated_at = ?, error_message = NULL
+                    updated_at = ?
                 WHERE job_id = ?
                   AND status IN (?, ?)
                   AND cancel_requested = 0
@@ -265,6 +265,7 @@ class DocumentJobRegistry:
             status=DocumentJobStatus.SUCCEEDED.value,
             stage=DocumentJobStage.COMPLETED.value,
             progress=100,
+            error_message=None,
             locked_by=None,
             locked_at=None,
             heartbeat_at=now.isoformat(),

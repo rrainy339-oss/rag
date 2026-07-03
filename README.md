@@ -159,7 +159,7 @@ Open the administrator login page:
 D:\codex project\my rag\frontend\admin-login.html
 ```
 
-Default local administrator credentials:
+Default local administrator credentials, seeded into the auth database:
 
 ```text
 admin / admin123
@@ -171,7 +171,7 @@ Open the user Q&A login page:
 D:\codex project\my rag\frontend\chat-login.html
 ```
 
-Default local user credentials:
+Default local user credentials, seeded into the auth database:
 
 ```text
 user / user123
@@ -227,8 +227,8 @@ The API supports four auth modes:
 
 - `disabled`: local demo mode; request ACL fields are accepted.
 - `dev`: trusted local simulation using environment variables or `x-rag-*` headers.
-- `jwt`: local JWT login mode using `/api/auth/admin/login` and
-  `/api/auth/chat/login`.
+- `jwt`: database-backed username/password login using
+  `/api/auth/admin/login` and `/api/auth/chat/login`.
 - `oidc`: JWT/OIDC mode using JWKS and claim mapping.
 
 Local JWT auth example:
@@ -236,11 +236,26 @@ Local JWT auth example:
 ```powershell
 $env:RAG_AUTH_MODE="jwt"
 $env:RAG_JWT_SECRET="replace-this-local-secret"
+$env:RAG_AUTH_DB_PATH="artifacts\security\auth.sqlite3"
 $env:RAG_JWT_ADMIN_USERNAME="admin"
 $env:RAG_JWT_ADMIN_PASSWORD="admin123"
 $env:RAG_JWT_USER_USERNAME="user"
 $env:RAG_JWT_USER_PASSWORD="user123"
 ```
+
+JWT login checks the `auth_users` table, verifies the stored password hash, then
+builds the JWT from database fields such as tenant, user id, groups, roles,
+scopes, and max classification. The `RAG_JWT_*_USERNAME/PASSWORD` values are
+used only to seed default local users when `RAG_AUTH_SEED_DEFAULT_USERS=true`.
+
+Seed the local auth database explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\seed_auth_users.py
+```
+
+For production-like deployments, set `RAG_AUTH_SEED_DEFAULT_USERS=false` and
+manage rows in `auth_users` through your own admin process or migration flow.
 
 Development auth example:
 

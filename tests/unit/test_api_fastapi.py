@@ -114,60 +114,68 @@ class FastAPIAppTest(unittest.TestCase):
         from app.api import main as api_main
         from app.security import SecuritySettings
 
-        api_main.security_settings = SecuritySettings(
-            auth_mode="jwt",
-            jwt_secret="test-secret",
-            jwt_admin_username="admin",
-            jwt_admin_password="admin-pass",
-            jwt_user_username="user",
-            jwt_user_password="user-pass",
-        )
-        api_main.audit_logger = api_main.AuditLogger.from_settings(
-            api_main.security_settings
-        )
-        client = TestClient(api_main.app)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            api_main.security_settings = SecuritySettings(
+                auth_mode="jwt",
+                jwt_secret="test-secret",
+                auth_db_path=Path(temp_dir) / "auth.sqlite3",
+                jwt_admin_username="admin",
+                jwt_admin_password="admin-pass",
+                jwt_admin_tenant_id="tenant-db",
+                jwt_admin_email="admin@example.com",
+                jwt_user_username="user",
+                jwt_user_password="user-pass",
+            )
+            api_main.audit_logger = api_main.AuditLogger.from_settings(
+                api_main.security_settings
+            )
+            api_main.reset_runtime_for_tests()
+            client = TestClient(api_main.app)
 
-        admin_login = client.post(
-            "/api/auth/admin/login",
-            json={"username": "admin", "password": "admin-pass"},
-            headers={"x-request-id": "admin-login-test"},
-        )
-        chat_login = client.post(
-            "/api/auth/chat/login",
-            json={"username": "user", "password": "user-pass"},
-            headers={"x-request-id": "chat-login-test"},
-        )
+            admin_login = client.post(
+                "/api/auth/admin/login",
+                json={"username": "admin", "password": "admin-pass"},
+                headers={"x-request-id": "admin-login-test"},
+            )
+            chat_login = client.post(
+                "/api/auth/chat/login",
+                json={"username": "user", "password": "user-pass"},
+                headers={"x-request-id": "chat-login-test"},
+            )
 
-        admin_token = admin_login.json()["access_token"]
-        user_token = chat_login.json()["access_token"]
-        admin_me = client.get(
-            "/api/me",
-            headers={
-                "authorization": f"Bearer {admin_token}",
-                "x-request-id": "admin-me-test",
-            },
-        )
-        user_me = client.get(
-            "/api/me",
-            headers={
-                "authorization": f"Bearer {user_token}",
-                "x-request-id": "user-me-test",
-            },
-        )
-        user_documents = client.get(
-            "/api/documents",
-            headers={
-                "authorization": f"Bearer {user_token}",
-                "x-request-id": "user-documents-test",
-            },
-        )
-        api_main.security_settings = SecuritySettings(auth_mode="disabled")
-        api_main.audit_logger = api_main.AuditLogger.from_settings(
-            api_main.security_settings
-        )
+            admin_token = admin_login.json()["access_token"]
+            user_token = chat_login.json()["access_token"]
+            admin_me = client.get(
+                "/api/me",
+                headers={
+                    "authorization": f"Bearer {admin_token}",
+                    "x-request-id": "admin-me-test",
+                },
+            )
+            user_me = client.get(
+                "/api/me",
+                headers={
+                    "authorization": f"Bearer {user_token}",
+                    "x-request-id": "user-me-test",
+                },
+            )
+            user_documents = client.get(
+                "/api/documents",
+                headers={
+                    "authorization": f"Bearer {user_token}",
+                    "x-request-id": "user-documents-test",
+                },
+            )
+            api_main.security_settings = SecuritySettings(auth_mode="disabled")
+            api_main.audit_logger = api_main.AuditLogger.from_settings(
+                api_main.security_settings
+            )
+            api_main.reset_runtime_for_tests()
 
         self.assertEqual(admin_login.status_code, 200)
         self.assertEqual(chat_login.status_code, 200)
+        self.assertEqual(admin_me.json()["tenant_id"], "tenant-db")
+        self.assertEqual(admin_me.json()["email"], "admin@example.com")
         self.assertTrue(admin_me.json()["can_manage_documents"])
         self.assertTrue(admin_me.json()["can_chat"])
         self.assertFalse(user_me.json()["can_manage_documents"])

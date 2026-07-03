@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import traceback
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -181,7 +182,7 @@ class DocumentService:
         except Exception as exc:
             return self.job_registry.mark_failed(
                 job.job_id,
-                error_message=str(exc),
+                error_message=_exception_traceback(exc),
                 retry_delay_seconds=_retry_delay_seconds(job.attempt),
             )
 
@@ -194,29 +195,60 @@ class DocumentService:
     ) -> DocumentRecord:
         try:
             record = self._require_document(document_id)
-            self._set_job_stage(job_id, DocumentJobStage.PARSING, 10)
-            record = self.registry.update_status(record.document_id, DocumentStatus.PARSING)
-            parsed_document, parsed_json_path = self._parse_document(record)
-            self._raise_if_cancelled(job_id)
 
-            self._set_job_stage(job_id, DocumentJobStage.CHUNKING, 35)
-            self.registry.update_artifacts(
-                record.document_id,
-                parsed_path=parsed_json_path,
-                status=DocumentStatus.CHUNKING,
-            )
-            chunking_result, chunks_path = self._chunk_document(record, parsed_document)
-            self._raise_if_cancelled(job_id)
+            chunking_result: ChunkingResult | None = None
+            chunks_path = _existing_path(record.chunks_path)
+            if chunks_path is not None:
+                chunking_result, chunks_path = self._load_chunking_result(
+                    record,
+                    chunks_path,
+                )
+            else:
+                parsed_document: ParsedDocument | None = None
+                parsed_json_path = _existing_path(record.parsed_path)
+                if parsed_json_path is not None:
+                    parsed_document, parsed_json_path = self._load_parsed_document(
+                        record,
+                        parsed_json_path,
+                    )
+                else:
+                    self._set_job_stage(job_id, DocumentJobStage.PARSING, 10)
+                    record = self.registry.update_status(
+                        record.document_id,
+                        DocumentStatus.PARSING,
+                    )
+                    parsed_document, parsed_json_path = self._parse_document(record)
+                    self._raise_if_cancelled(job_id)
+
+                self._set_job_stage(job_id, DocumentJobStage.CHUNKING, 35)
+                record = self.registry.update_artifacts(
+                    record.document_id,
+                    parsed_path=parsed_json_path,
+                    status=DocumentStatus.CHUNKING,
+                )
+                chunking_result, chunks_path = self._chunk_document(
+                    record,
+                    parsed_document,
+                )
+                self._raise_if_cancelled(job_id)
 
             self._set_job_stage(job_id, DocumentJobStage.EMBEDDING, 60)
-            self.registry.update_artifacts(
+            record = self.registry.update_artifacts(
                 record.document_id,
                 chunks_path=chunks_path,
                 chunk_count=len(chunking_result.chunks),
                 status=DocumentStatus.INDEXING,
             )
-            self._set_job_stage(job_id, DocumentJobStage.INDEXING, 75)
-            indexing_result, index_path = self._index_document(record, chunking_result)
+
+            index_path = _existing_path(record.index_path)
+            if index_path is not None:
+                indexing_result, index_path = self._load_indexing_result(
+                    record,
+                    index_path,
+                )
+            else:
+                self._set_job_stage(job_id, DocumentJobStage.INDEXING, 75)
+                indexing_result, index_path = self._index_document(record, chunking_result)
             self._raise_if_cancelled(job_id)
 
             self._set_job_stage(job_id, DocumentJobStage.REBUILDING_COLLECTION, 90)
@@ -288,7 +320,7 @@ class DocumentService:
         if existing.status == DocumentStatus.READY:
             indexing_result = self._rewrite_access(record)
             if indexing_result is not None:
-                self._upsert_index_records(indexing_result)
+                self._set_index_record_payloads(indexing_result)
             self.rebuild_collection()
             self._notify_collection_updated()
         return record
@@ -360,6 +392,42 @@ class DocumentService:
         chunks_path = chunks_dir / f"{Path(record.filename).stem}.chunks.json"
         chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
         return chunking_result, chunks_path
+
+    def _load_parsed_document(
+        self,
+        record: DocumentRecord,
+        parsed_json_path: Path,
+    ) -> tuple[ParsedDocument, Path]:
+        parsed_document = ParsedDocument.model_validate_json(
+            parsed_json_path.read_text(encoding="utf-8")
+        )
+        parsed_document = _normalize_parsed_document(parsed_document, record)
+        parsed_json_path.write_text(parsed_document.to_json(), encoding="utf-8")
+        return parsed_document, parsed_json_path
+
+    def _load_chunking_result(
+        self,
+        record: DocumentRecord,
+        chunks_path: Path,
+    ) -> tuple[ChunkingResult, Path]:
+        chunking_result = ChunkingResult.model_validate_json(
+            chunks_path.read_text(encoding="utf-8")
+        )
+        _enrich_chunks(chunking_result, record)
+        chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+        return chunking_result, chunks_path
+
+    def _load_indexing_result(
+        self,
+        record: DocumentRecord,
+        index_path: Path,
+    ) -> tuple[IndexingResult, Path]:
+        indexing_result = IndexingResult.model_validate_json(
+            index_path.read_text(encoding="utf-8")
+        )
+        _enrich_index_records(indexing_result, record)
+        index_path.write_text(indexing_result.to_json(), encoding="utf-8")
+        return indexing_result, index_path
 
     def _index_document(
         self,
@@ -470,16 +538,19 @@ class DocumentService:
                     pass
         return self._configured_embedding_dimension()
 
-    def _upsert_index_records(self, indexing_result: IndexingResult) -> None:
+    def _set_index_record_payloads(self, indexing_result: IndexingResult) -> int:
         if not indexing_result.records:
-            return
+            return 0
 
         vector_store = None
         try:
             vector_store = self._build_vector_store(
                 embedding_dimension=indexing_result.manifest.embedding_dimension,
             )
-            vector_store.upsert(indexing_result.records)
+            set_payload = getattr(vector_store, "set_payload", None)
+            if callable(set_payload):
+                return int(set_payload(indexing_result.records) or 0)
+            raise RuntimeError("Vector store does not support payload-only updates.")
         finally:
             close = getattr(vector_store, "close", None)
             if callable(close):
@@ -793,6 +864,20 @@ def _retry_delay_seconds(attempt: int) -> int:
     delays = [30, 120, 600]
     index = max(0, min(len(delays) - 1, attempt - 1))
     return delays[index]
+
+
+def _exception_traceback(exc: Exception) -> str:
+    formatted = traceback.format_exc()
+    if formatted and formatted.strip() != "NoneType: None":
+        return formatted
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _existing_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    return path if path.exists() else None
 
 
 def _safe_filename(value: str) -> str:

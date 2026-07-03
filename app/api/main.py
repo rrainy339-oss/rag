@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import hmac
 from pathlib import Path
 from uuid import uuid4
 
@@ -32,6 +31,7 @@ from app.api.settings import APISettings
 from app.documents import DocumentJobType, DocumentService
 from app.security import (
     AuditLogger,
+    AuthService,
     AuthError,
     Principal,
     SecuritySettings,
@@ -49,6 +49,7 @@ _runtime_collection_signature: (
     tuple[tuple[int, int] | None, tuple[int, int] | None] | None
 ) = None
 _document_service: DocumentService | None = None
+_auth_service: AuthService | None = None
 
 
 def close_runtime() -> None:
@@ -113,6 +114,13 @@ def get_document_service() -> DocumentService:
     return _document_service
 
 
+def get_auth_service() -> AuthService:
+    global _auth_service
+    if _auth_service is None:
+        _auth_service = AuthService(security_settings)
+    return _auth_service
+
+
 def get_current_principal(request: Request) -> Principal:
     try:
         return authenticate_request(request, security_settings)
@@ -161,9 +169,14 @@ def healthz() -> HealthResponse:
 def admin_login(
     request_body: LoginRequest,
     request: Request,
+    auth_service: AuthService = Depends(get_auth_service),
 ) -> TokenResponse:
     try:
-        principal = _principal_for_login(request_body, login_type="admin")
+        principal = _principal_for_login(
+            request_body,
+            login_type="admin",
+            auth_service=auth_service,
+        )
         return _issue_token(principal, request_id=request.state.request_id)
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -173,9 +186,14 @@ def admin_login(
 def chat_login(
     request_body: LoginRequest,
     request: Request,
+    auth_service: AuthService = Depends(get_auth_service),
 ) -> TokenResponse:
     try:
-        principal = _principal_for_login(request_body, login_type="chat")
+        principal = _principal_for_login(
+            request_body,
+            login_type="chat",
+            auth_service=auth_service,
+        )
         return _issue_token(principal, request_id=request.state.request_id)
     except Exception as exc:
         raise _http_error(exc) from exc
@@ -563,9 +581,10 @@ def delete_document(
 
 
 def reset_runtime_for_tests() -> None:
-    global _document_service
+    global _auth_service, _document_service
     close_runtime()
     _document_service = None
+    _auth_service = None
 
 
 def _http_error(exc: Exception) -> HTTPException:
@@ -592,56 +611,16 @@ def _has_scope(principal: Principal, scope: str) -> bool:
     )
 
 
-def _principal_for_login(request_body: LoginRequest, *, login_type: str) -> Principal:
-    if login_type == "admin":
-        if not _credentials_match(
-            request_body,
-            username=security_settings.jwt_admin_username,
-            password=security_settings.jwt_admin_password,
-        ):
-            raise AuthError("Invalid administrator credentials.", status_code=401)
-        return Principal(
-            subject=security_settings.jwt_admin_subject,
-            tenant_id=security_settings.jwt_admin_tenant_id,
-            user_id=security_settings.jwt_admin_user_id,
-            email=security_settings.jwt_admin_email,
-            group_ids=security_settings.jwt_admin_group_ids,
-            roles=security_settings.jwt_admin_roles,
-            scopes=security_settings.jwt_admin_scopes,
-            max_classification=security_settings.jwt_admin_max_classification,
-            auth_mode="jwt",
-            enforce_permissions=True,
-        )
-
-    if not _credentials_match(
-        request_body,
-        username=security_settings.jwt_user_username,
-        password=security_settings.jwt_user_password,
-    ):
-        raise AuthError("Invalid chat credentials.", status_code=401)
-    return Principal(
-        subject=security_settings.jwt_user_subject,
-        tenant_id=security_settings.jwt_user_tenant_id,
-        user_id=security_settings.jwt_user_user_id,
-        email=security_settings.jwt_user_email,
-        group_ids=security_settings.jwt_user_group_ids,
-        roles=security_settings.jwt_user_roles,
-        scopes=security_settings.jwt_user_scopes,
-        max_classification=security_settings.jwt_user_max_classification,
-        auth_mode="jwt",
-        enforce_permissions=True,
-    )
-
-
-def _credentials_match(
+def _principal_for_login(
     request_body: LoginRequest,
     *,
-    username: str,
-    password: str,
-) -> bool:
-    return hmac.compare_digest(request_body.username, username) and hmac.compare_digest(
+    login_type: str,
+    auth_service: AuthService,
+) -> Principal:
+    return auth_service.authenticate_login(
+        request_body.username,
         request_body.password,
-        password,
+        login_type=login_type,
     )
 
 
