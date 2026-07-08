@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
 
 from app.api.settings import APISettings
 from app.documents.schemas import DocumentJobStatus, DocumentRecord, DocumentStatus
-from app.documents.service import DocumentService
+from app.documents.service import DocumentService, IndexAction
 from app.indexing.schemas import IndexBackend, IndexingResult
 from tests.unit.hybrid_fakes import CapturingHybridVectorStore, FakeHybridEmbeddingProvider
 from tests.unit.test_retrieval import _load_sample_chunks
@@ -109,18 +110,22 @@ class DocumentServiceTest(unittest.TestCase):
                 indexed_count=indexing_result.indexed_count,
                 status=DocumentStatus.READY,
             )
-
-            indexed_count_before_delete = vector_store.count()
-            deleted = service.delete_document(record.document_id)
-            indexed_count_after_delete = vector_store.count()
-            collection = IndexingResult.model_validate_json(
-                settings.documents_collection_index_path.read_text(encoding="utf-8")
+            service.chunk_repository.replace_document_chunks(
+                record.document_id,
+                chunking_result.chunks,
             )
 
+            indexed_count_before_delete = vector_store.count()
+            chunk_count_before_delete = service.chunk_repository.count()
+            deleted = service.delete_document(record.document_id)
+            indexed_count_after_delete = vector_store.count()
+            chunk_count_after_delete = service.chunk_repository.count()
+
         self.assertGreater(indexed_count_before_delete, 0)
+        self.assertGreater(chunk_count_before_delete, 0)
         self.assertEqual(indexed_count_after_delete, 0)
         self.assertEqual(deleted.status, DocumentStatus.DELETED)
-        self.assertEqual(collection.indexed_count, 0)
+        self.assertEqual(chunk_count_after_delete, 0)
 
     def test_delete_document_keeps_record_ready_when_qdrant_delete_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -159,6 +164,94 @@ class DocumentServiceTest(unittest.TestCase):
 
         self.assertIsNotNone(current)
         self.assertEqual(current.status, DocumentStatus.READY)
+
+    def test_create_document_result_deduplicates_same_content_and_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+
+            first = service.create_document_result(
+                filename="handbook.txt",
+                content_type="text/plain",
+                file=BytesIO(b"same handbook"),
+                title="First",
+                tenant_id="tenant-a",
+                owner_id="owner-1",
+                group_ids=["legal"],
+                principal_ids=["user-1"],
+                classification="confidential",
+            )
+            duplicate = service.create_document_result(
+                filename="handbook-copy.txt",
+                content_type="text/plain",
+                file=BytesIO(b"same handbook"),
+                title="Duplicate title",
+                tenant_id="tenant-a",
+                owner_id="owner-1",
+                group_ids=["legal"],
+                principal_ids=["user-1"],
+                classification="confidential",
+            )
+            different_access = service.create_document_result(
+                filename="handbook-finance.txt",
+                content_type="text/plain",
+                file=BytesIO(b"same handbook"),
+                title="Finance copy",
+                tenant_id="tenant-a",
+                owner_id="owner-1",
+                group_ids=["finance"],
+                principal_ids=["user-1"],
+                classification="confidential",
+            )
+            documents = service.list_documents()
+
+        self.assertTrue(first.created)
+        self.assertFalse(duplicate.created)
+        self.assertEqual(duplicate.record.document_id, first.record.document_id)
+        self.assertTrue(different_access.created)
+        self.assertEqual(len(documents), 2)
+
+    def test_create_document_result_deduplicates_legacy_record_without_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+
+            first = service.create_document_result(
+                filename="handbook.txt",
+                content_type="text/plain",
+                file=BytesIO(b"legacy handbook"),
+                title="First",
+                tenant_id="tenant-a",
+                owner_id="owner-1",
+                group_ids=["legal"],
+                principal_ids=["user-1"],
+                classification="confidential",
+            )
+            service.registry.update(
+                first.record.document_id,
+                access_signature=None,
+                dedupe_key=None,
+            )
+            duplicate = service.create_document_result(
+                filename="handbook-copy.txt",
+                content_type="text/plain",
+                file=BytesIO(b"legacy handbook"),
+                title="Duplicate title",
+                tenant_id="tenant-a",
+                owner_id="owner-1",
+                group_ids=["legal"],
+                principal_ids=["user-1"],
+                classification="confidential",
+            )
+            refreshed = service.get_document(first.record.document_id)
+
+        self.assertFalse(duplicate.created)
+        self.assertEqual(duplicate.record.document_id, first.record.document_id)
+        self.assertIsNotNone(refreshed)
+        self.assertIsNotNone(refreshed.access_signature)
+        self.assertIsNotNone(refreshed.dedupe_key)
 
     def test_update_permissions_rewrites_qdrant_payloads_for_ready_document(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -203,6 +296,7 @@ class DocumentServiceTest(unittest.TestCase):
             local_index = IndexingResult.model_validate_json(
                 index_path.read_text(encoding="utf-8")
             )
+            synced_chunk = service.chunk_repository.get("child-remote")
 
         self.assertEqual(updated.tenant_id, "tenant-b")
         self.assertEqual(vector_store.upsert_calls, upsert_calls_before)
@@ -219,6 +313,9 @@ class DocumentServiceTest(unittest.TestCase):
         self.assertEqual(synced_record.metadata["classification"], "secret")
         self.assertEqual(local_index.records[0].access.tenant_id, "tenant-b")
         self.assertEqual(local_index.records[0].metadata["tenant_id"], "tenant-b")
+        self.assertIsNotNone(synced_chunk)
+        self.assertEqual(synced_chunk.access.tenant_id, "tenant-b")
+        self.assertEqual(synced_chunk.access.allowed_group_ids, ["finance"])
 
     def test_document_job_runs_successfully_from_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -288,10 +385,143 @@ class DocumentServiceTest(unittest.TestCase):
             service._chunk_document = fail_chunk  # type: ignore[method-assign]
 
             completed = service.process_document(record.document_id, raise_errors=True)
+            synced_parent = service.chunk_repository.get("parent-remote")
+            manifest = service.manifest_repository.get(settings.qdrant_collection)
 
         self.assertEqual(completed.status, DocumentStatus.READY)
         self.assertGreater(vector_store.count(), 0)
         self.assertIsNotNone(completed.index_path)
+        self.assertIsNotNone(synced_parent)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest.embedding_model, provider.model_name)
+        self.assertFalse(settings.documents_collection_index_path.exists())
+        self.assertFalse(settings.documents_collection_chunks_path.exists())
+
+    def test_process_document_skips_ready_document_with_matching_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: vector_store
+            )
+
+            record = _record(root)
+            service.registry.create(record)
+            chunking_result = _sample_chunks(record.document_id)
+            chunks_path = root / "chunks.json"
+            chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+            service.registry.update_artifacts(
+                record.document_id,
+                chunks_path=chunks_path,
+                chunk_count=len(chunking_result.chunks),
+                status=DocumentStatus.FAILED,
+                error_message="previous indexing failure",
+            )
+            first = service.process_document(record.document_id, raise_errors=True)
+            upsert_calls_after_first_run = vector_store.upsert_calls
+
+            def fail_parse(record: DocumentRecord) -> object:
+                del record
+                raise AssertionError("parse should be skipped")
+
+            def fail_chunk(record: DocumentRecord, parsed_document: object) -> object:
+                del record, parsed_document
+                raise AssertionError("chunking should be skipped")
+
+            def fail_index(record: DocumentRecord, chunking_result: object) -> object:
+                del record, chunking_result
+                raise AssertionError("indexing should be skipped")
+
+            service._parse_document = fail_parse  # type: ignore[method-assign]
+            service._chunk_document = fail_chunk  # type: ignore[method-assign]
+            service._index_document = fail_index  # type: ignore[method-assign]
+            second = service.process_document(record.document_id, raise_errors=True)
+
+        self.assertEqual(first.status, DocumentStatus.READY)
+        self.assertEqual(second.status, DocumentStatus.READY)
+        self.assertEqual(vector_store.upsert_calls, upsert_calls_after_first_run)
+
+    def test_index_version_change_reindexes_without_rechunking(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: vector_store
+            )
+
+            record = _record(root)
+            service.registry.create(record)
+            chunking_result = _sample_chunks(record.document_id)
+            chunks_path = root / "chunks.json"
+            chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+            service.registry.update_artifacts(
+                record.document_id,
+                chunks_path=chunks_path,
+                chunk_count=len(chunking_result.chunks),
+                status=DocumentStatus.FAILED,
+                error_message="previous indexing failure",
+            )
+            service.process_document(record.document_id, raise_errors=True)
+            settings.documents_index_version = "idx-v2"
+
+            def fail_parse(record: DocumentRecord) -> object:
+                del record
+                raise AssertionError("parse should not run when chunks are reusable")
+
+            def fail_chunk(record: DocumentRecord, parsed_document: object) -> object:
+                del record, parsed_document
+                raise AssertionError("chunking should not run when chunks are reusable")
+
+            service._parse_document = fail_parse  # type: ignore[method-assign]
+            service._chunk_document = fail_chunk  # type: ignore[method-assign]
+            reindexed = service.process_document(record.document_id, raise_errors=True)
+            manifest = service.document_index_manifest_repository.get(record.document_id)
+
+        self.assertEqual(reindexed.status, DocumentStatus.READY)
+        self.assertEqual(vector_store.upsert_calls, 2)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest.index_version, "idx-v2")
+
+    def test_chunk_config_change_requires_rechunk_and_reindex(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings = _document_settings(root)
+            service = DocumentService(settings)
+            provider = FakeHybridEmbeddingProvider()
+            vector_store = CapturingHybridVectorStore()
+            service._build_embedding_provider = lambda: provider  # type: ignore[method-assign]
+            service._build_vector_store = (  # type: ignore[method-assign]
+                lambda *, embedding_dimension: vector_store
+            )
+
+            record = _record(root)
+            service.registry.create(record)
+            chunking_result = _sample_chunks(record.document_id)
+            chunks_path = root / "chunks.json"
+            chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
+            service.registry.update_artifacts(
+                record.document_id,
+                chunks_path=chunks_path,
+                chunk_count=len(chunking_result.chunks),
+                status=DocumentStatus.FAILED,
+            )
+            service.process_document(record.document_id, raise_errors=True)
+            settings.documents_child_target_tokens = 512
+            current = service.registry.get(record.document_id)
+            self.assertIsNotNone(current)
+            plan = service._plan_document_index(current)
+
+        self.assertEqual(plan.action, IndexAction.REINDEX)
+        self.assertTrue(plan.reuse_parsed)
+        self.assertFalse(plan.reuse_chunks)
 
     def test_document_job_failure_respects_max_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -27,11 +27,14 @@ from app.api.schemas import (
     RetrievalRequest,
 )
 from app.api.settings import APISettings
-from app.chunking.schemas import ChunkingResult
+from app.documents.chunks import ChunkRepository
+from app.documents.manifest import (
+    CollectionManifestRepository,
+    build_collection_manifest,
+)
 from app.indexing.embeddings.bge import BGEM3EmbeddingProvider
-from app.indexing.schemas import IndexingResult
+from app.indexing.schemas import IndexManifest, IndexingResult
 from app.indexing.vectorstores.qdrant import QdrantHybridVectorStore
-from app.retrieval.chunk_store import ChunkStore
 from app.retrieval.config import RetrievalConfig
 from app.retrieval.context_builder import ContextBuilder
 from app.retrieval.parent_expander import ParentExpander
@@ -47,11 +50,16 @@ from app.security.schemas import Principal
 class RAGRuntime:
     def __init__(self, settings: APISettings) -> None:
         self.settings = settings
-        self.indexing_result = _load_indexing_result(settings.index_path)
-        self.chunking_result = _load_chunking_result(settings.chunks_path)
+        self.manifest_repository = CollectionManifestRepository(
+            settings.documents_db_path
+        )
+        self.collection_manifest = _load_collection_manifest(
+            settings,
+            self.manifest_repository,
+        )
         self.embedding_provider = self._build_embedding_provider()
         self.vector_store = self._build_vector_store()
-        self.chunk_store = ChunkStore.from_chunking_result(self.chunking_result)
+        self.chunk_store = ChunkRepository(settings.documents_db_path)
         self.reranker = self._build_reranker()
 
     def retrieve(
@@ -165,15 +173,15 @@ class RAGRuntime:
         )
 
     def _build_embedding_provider(self) -> object:
-        if "bge-m3" not in self.indexing_result.manifest.embedding_model.lower():
+        if "bge-m3" not in self.collection_manifest.embedding_model.lower():
             raise RuntimeConfigurationError(
                 "Runtime requires a BGE-M3 hybrid index manifest, got "
-                f"{self.indexing_result.manifest.embedding_model!r}."
+                f"{self.collection_manifest.embedding_model!r}."
             )
         return BGEM3EmbeddingProvider(
             model_name=(
                 self.settings.bge_model
-                or self.indexing_result.manifest.embedding_model
+                or self.collection_manifest.embedding_model
             ),
             use_fp16=self.settings.bge_use_fp16,
             max_length=self.settings.bge_max_length,
@@ -195,7 +203,7 @@ class RAGRuntime:
             path=qdrant_path,
             api_key=self.settings.qdrant_api_key,
             collection_name=self.settings.qdrant_collection,
-            vector_size=self.indexing_result.manifest.embedding_dimension,
+            vector_size=self.collection_manifest.embedding_dimension,
             dense_vector_name=self.settings.dense_vector_name,
             sparse_vector_name=self.settings.sparse_vector_name,
             timeout=self.settings.qdrant_timeout,
@@ -330,16 +338,33 @@ def _retrieval_query(
     )
 
 
+def _load_collection_manifest(
+    settings: APISettings,
+    repository: CollectionManifestRepository,
+) -> IndexManifest:
+    manifest = repository.get(settings.qdrant_collection)
+    if manifest is not None:
+        return manifest
+    if settings.index_path.exists():
+        manifest = _load_indexing_result(settings.index_path).manifest
+        repository.save(settings.qdrant_collection, manifest)
+        return manifest
+    manifest = build_collection_manifest(
+        embedding_model=settings.bge_model or "BAAI/bge-m3",
+        embedding_dimension=BGEM3EmbeddingProvider.dimension,
+        dense_vector_name=settings.dense_vector_name,
+        sparse_vector_name=settings.sparse_vector_name,
+        sparse_top_n=settings.sparse_top_n,
+        index_version=settings.documents_index_version,
+    )
+    repository.save(settings.qdrant_collection, manifest)
+    return manifest
+
+
 def _load_indexing_result(path: Path) -> IndexingResult:
     if not path.exists():
         raise RuntimeConfigurationError(f"Index file does not exist: {path}")
     return IndexingResult.model_validate_json(path.read_text(encoding="utf-8"))
-
-
-def _load_chunking_result(path: Path) -> ChunkingResult:
-    if not path.exists():
-        raise RuntimeConfigurationError(f"Chunks file does not exist: {path}")
-    return ChunkingResult.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def _to_retrieval_api_response(

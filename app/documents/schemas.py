@@ -56,6 +56,8 @@ class DocumentRecord(BaseModel):
     content_type: str | None = None
     size_bytes: int = 0
     content_hash: str
+    access_signature: str | None = None
+    dedupe_key: str | None = None
     source_path: str
     parsed_path: str | None = None
     chunks_path: str | None = None

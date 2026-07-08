@@ -4,8 +4,10 @@ This project now keeps one production-oriented ingestion and retrieval path:
 
 ```text
 frontend upload -> FastAPI document service -> Docling parse -> hierarchical chunks
-chunks -> BGE-M3 dense+sparse embeddings -> Qdrant hybrid collection
-query -> BGE-M3 dense+sparse query embedding -> Qdrant hybrid retrieval -> rerank -> answer
+chunks -> SQLite chunk repository + BGE-M3 dense+sparse embeddings
+embeddings -> Qdrant hybrid collection + lightweight collection manifest
+query -> BGE-M3 dense+sparse query embedding -> Qdrant hybrid retrieval
+hit parent expansion from chunk repository -> rerank -> answer
 ```
 
 Legacy local demo implementations and old offline indexing/retrieval scripts
@@ -15,7 +17,8 @@ have been removed from the test branch.
 
 - `frontend/`: browser UI for chat settings and document management.
 - `app/api/`: FastAPI endpoints for chat, retrieval, model listing, and documents.
-- `app/documents/`: upload registry, permissions, parse/chunk/index orchestration.
+- `app/documents/`: upload registry, chunk repository, collection manifest,
+  permissions, parse/chunk/index orchestration.
 - `app/ingestion/`: local file parsing pipeline.
 - `app/parsing/`: Docling adapter and normalized parsed document model.
 - `app/chunking/`: parent/child/table chunk generation.
@@ -96,7 +99,8 @@ The runtime only supports `qdrant_hybrid` and `bge-m3`; those are the defaults.
 
 Uploads and reindex requests create durable rows in `document_jobs`. Run a
 separate worker process to execute parsing, chunking, BGE-M3 dense+sparse
-encoding, Qdrant hybrid upsert, retry, cancellation checks, and progress updates:
+encoding, Qdrant hybrid upsert, SQLite chunk repository updates, manifest
+updates, retry, cancellation checks, and progress updates:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\document_worker.py
@@ -108,8 +112,21 @@ For a smoke test that claims at most one runnable job:
 .\.venv\Scripts\python.exe scripts\document_worker.py --once
 ```
 
-The API process watches the collection artifact timestamps and reloads its
-runtime after the worker rebuilds the collection files.
+The online runtime no longer depends on rebuilding combined collection JSON
+files. Qdrant stores vectors, SQLite stores chunks for parent expansion, and
+SQLite manifests store collection-level vector configuration plus document-level
+index signatures. Upload deduplication uses content hash + access signature,
+while repeat indexing is skipped only when content, parser config, chunk config,
+embedding config, access signature, and `RAG_DOCUMENTS_INDEX_VERSION` all match.
+The legacy `rebuild_collection()` path is kept as an explicit debug/export
+snapshot, not as the normal ingestion path.
+
+Useful document-index controls:
+
+- `RAG_DOCUMENTS_DEDUPE_ENABLED`: enable or disable same-content/same-access
+  upload deduplication.
+- `RAG_DOCUMENTS_INDEX_VERSION`: bump this when index semantics change and all
+  documents should be reindexed even if source content is unchanged.
 
 ## API Endpoints
 

@@ -9,6 +9,8 @@ from unittest.mock import patch
 from app.api.runtime import RAGRuntime
 from app.api.schemas import ChatRequest, RetrievalRequest
 from app.api.settings import APISettings
+from app.documents.chunks import ChunkRepository
+from app.documents.manifest import CollectionManifestRepository
 from app.indexing.config import IndexingConfig
 from app.indexing.indexer import EnterpriseIndexer
 from app.indexing.schemas import IndexingResult
@@ -91,20 +93,26 @@ class APIRuntimeTest(unittest.TestCase):
 
 
 def _settings(temp_dir: Path) -> tuple[APISettings, IndexingResult]:
-    index_path, chunks_path, indexing_result = _write_runtime_artifacts(temp_dir)
-    return (
-        APISettings(
-            index_path=index_path,
-            chunks_path=chunks_path,
-            llm_provider="mock",
-            final_top_k=2,
-            qdrant_collection="test_runtime_chunks",
-        ),
-        indexing_result,
+    index_path, chunks_path, indexing_result, chunking_result = _write_runtime_artifacts(
+        temp_dir
     )
+    settings = APISettings(
+        index_path=index_path,
+        chunks_path=chunks_path,
+        documents_db_path=temp_dir / "documents.sqlite3",
+        llm_provider="mock",
+        final_top_k=2,
+        qdrant_collection="test_runtime_chunks",
+    )
+    ChunkRepository(settings.documents_db_path).replace_all(chunking_result.chunks)
+    CollectionManifestRepository(settings.documents_db_path).save(
+        settings.qdrant_collection,
+        indexing_result.manifest,
+    )
+    return settings, indexing_result
 
 
-def _write_runtime_artifacts(temp_dir: Path) -> tuple[Path, Path, IndexingResult]:
+def _write_runtime_artifacts(temp_dir: Path):
     chunking_result = _load_sample_chunks()
     provider = FakeHybridEmbeddingProvider()
     vector_store = CapturingHybridVectorStore()
@@ -121,7 +129,7 @@ def _write_runtime_artifacts(temp_dir: Path) -> tuple[Path, Path, IndexingResult
     index_path = temp_dir / "sample.index.json"
     chunks_path.write_text(chunking_result.to_json(), encoding="utf-8")
     index_path.write_text(indexing_result.to_json(), encoding="utf-8")
-    return index_path, chunks_path, indexing_result
+    return index_path, chunks_path, indexing_result, chunking_result
 
 
 @contextmanager

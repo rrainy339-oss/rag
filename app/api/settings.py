@@ -29,6 +29,8 @@ class APISettings(BaseModel):
     documents_parent_target_tokens: int = Field(default=1400, ge=200)
     documents_parent_max_tokens: int = Field(default=2000, ge=300)
     documents_embedding_batch_size: int = Field(default=32, ge=1)
+    documents_index_version: str = "idx-v1"
+    documents_dedupe_enabled: bool = True
 
     backend: BackendName = "qdrant_hybrid"
     embedding_provider: EmbeddingProviderName = "bge-m3"
@@ -119,6 +121,8 @@ class APISettings(BaseModel):
             documents_parent_target_tokens=_int("RAG_DOCUMENTS_PARENT_TARGET_TOKENS", 1400),
             documents_parent_max_tokens=_int("RAG_DOCUMENTS_PARENT_MAX_TOKENS", 2000),
             documents_embedding_batch_size=_int("RAG_DOCUMENTS_EMBEDDING_BATCH_SIZE", 32),
+            documents_index_version=_str("RAG_DOCUMENTS_INDEX_VERSION", "idx-v1"),
+            documents_dedupe_enabled=_bool("RAG_DOCUMENTS_DEDUPE_ENABLED", True),
             backend=_str("RAG_API_BACKEND", "qdrant_hybrid"),
             embedding_provider=_str("RAG_API_EMBEDDING_PROVIDER", "bge-m3"),
             bge_model=_optional_str("RAG_API_BGE_MODEL"),

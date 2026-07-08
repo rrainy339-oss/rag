@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import StrEnum
 import hashlib
 import re
+import shutil
 import traceback
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -14,7 +17,17 @@ from app.api.settings import APISettings
 from app.chunking.config import ChunkingConfig
 from app.chunking.pipeline import ChunkingPipeline
 from app.chunking.schemas import ChunkingResult
+from app.documents.chunks import ChunkRepository
+from app.documents.fingerprints import (
+    access_signature as build_access_signature,
+    chunk_config_signature,
+    dedupe_key as build_dedupe_key,
+    embedding_config_signature,
+    parser_config_signature,
+)
+from app.documents.index_manifest import DocumentIndexManifestRepository
 from app.documents.jobs import DocumentJobRegistry, TERMINAL_JOB_STATUSES
+from app.documents.manifest import CollectionManifestRepository
 from app.documents.registry import DocumentRegistry
 from app.documents.schemas import (
     DocumentJob,
@@ -42,6 +55,35 @@ from app.ingestion.pipeline import LocalParsingPipeline
 CollectionUpdated = Callable[[], None]
 
 
+class IndexAction(StrEnum):
+    SKIP = "skip"
+    REINDEX = "reindex"
+
+
+@dataclass(frozen=True)
+class DocumentCreateResult:
+    record: DocumentRecord
+    created: bool
+
+
+@dataclass(frozen=True)
+class IndexSignatures:
+    parser_config_signature: str
+    chunk_config_signature: str
+    embedding_config_signature: str
+    access_signature: str
+    embedding_model: str
+    embedding_dimension: int
+
+
+@dataclass(frozen=True)
+class IndexPlan:
+    action: IndexAction
+    signatures: IndexSignatures
+    reuse_parsed: bool = True
+    reuse_chunks: bool = True
+
+
 class DocumentService:
     def __init__(
         self,
@@ -49,24 +91,53 @@ class DocumentService:
         *,
         registry: DocumentRegistry | None = None,
         job_registry: DocumentJobRegistry | None = None,
+        chunk_repository: ChunkRepository | None = None,
+        manifest_repository: CollectionManifestRepository | None = None,
+        document_index_manifest_repository: (
+            DocumentIndexManifestRepository | None
+        ) = None,
         on_collection_updated: CollectionUpdated | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry or DocumentRegistry(settings.documents_db_path)
         self.job_registry = job_registry or DocumentJobRegistry(settings.documents_db_path)
+        self.chunk_repository = chunk_repository or ChunkRepository(
+            settings.documents_db_path
+        )
+        self.manifest_repository = (
+            manifest_repository
+            or CollectionManifestRepository(settings.documents_db_path)
+        )
+        self.document_index_manifest_repository = (
+            document_index_manifest_repository
+            or DocumentIndexManifestRepository(settings.documents_db_path)
+        )
         self.on_collection_updated = on_collection_updated
         self._collection_lock = Lock()
 
     def ensure_collection_files(self) -> None:
-        if (
-            self.settings.index_path == self.settings.documents_collection_index_path
-            or self.settings.chunks_path == self.settings.documents_collection_chunks_path
-        ):
-            if (
-                not self.settings.documents_collection_index_path.exists()
-                or not self.settings.documents_collection_chunks_path.exists()
-            ):
-                self.rebuild_collection()
+        self.ensure_collection_state()
+
+    def ensure_collection_state(self) -> None:
+        if self.manifest_repository.get(self.settings.qdrant_collection) is not None:
+            return
+        manifest = self._legacy_collection_manifest()
+        if manifest is not None:
+            self.manifest_repository.save(self.settings.qdrant_collection, manifest)
+            return
+        self.manifest_repository.ensure(
+            self.settings.qdrant_collection,
+            embedding_model=self._configured_embedding_model(),
+            embedding_dimension=self._configured_embedding_dimension(),
+            dense_vector_name=self.settings.dense_vector_name,
+            sparse_vector_name=self.settings.sparse_vector_name,
+            sparse_top_n=self.settings.sparse_top_n,
+            index_version=self.settings.documents_index_version,
+        )
+
+    def collection_manifest_signature(self) -> tuple[object, ...] | None:
+        self.ensure_collection_state()
+        return self.manifest_repository.signature(self.settings.qdrant_collection)
 
     def create_document(
         self,
@@ -81,6 +152,31 @@ class DocumentService:
         principal_ids: list[str],
         classification: str | None,
     ) -> DocumentRecord:
+        return self.create_document_result(
+            filename=filename,
+            content_type=content_type,
+            file=file,
+            title=title,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            group_ids=group_ids,
+            principal_ids=principal_ids,
+            classification=classification,
+        ).record
+
+    def create_document_result(
+        self,
+        *,
+        filename: str,
+        content_type: str | None,
+        file: BinaryIO,
+        title: str | None,
+        tenant_id: str | None,
+        owner_id: str | None,
+        group_ids: list[str],
+        principal_ids: list[str],
+        classification: str | None,
+    ) -> DocumentCreateResult:
         document_id = str(uuid4())
         clean_filename = _safe_filename(filename)
         document_dir = self._document_dir(document_id)
@@ -88,25 +184,55 @@ class DocumentService:
         raw_dir.mkdir(parents=True, exist_ok=True)
         source_path = raw_dir / clean_filename
         size_bytes, content_hash = _write_and_hash(file, source_path)
+        clean_tenant_id = _clean(tenant_id)
+        clean_owner_id = _clean(owner_id)
+        clean_group_ids = _clean_many(group_ids)
+        clean_principal_ids = _clean_many(principal_ids)
+        clean_classification = _clean(classification)
+        signature = build_access_signature(
+            tenant_id=clean_tenant_id,
+            owner_id=clean_owner_id,
+            group_ids=clean_group_ids,
+            principal_ids=clean_principal_ids,
+            classification=clean_classification,
+        )
+        document_dedupe_key = build_dedupe_key(
+            content_hash=content_hash,
+            access_signature_value=signature,
+        )
+        if self.settings.documents_dedupe_enabled:
+            duplicate = self.registry.find_by_dedupe_key(document_dedupe_key)
+            if duplicate is None:
+                duplicate = self._find_legacy_duplicate(
+                    content_hash=content_hash,
+                    access_signature=signature,
+                    dedupe_key=document_dedupe_key,
+                )
+            if duplicate is not None:
+                _cleanup_document_dir(document_dir, self.settings.documents_storage_dir)
+                return DocumentCreateResult(record=duplicate, created=False)
+
         now = datetime.now(timezone.utc)
         record = DocumentRecord(
             document_id=document_id,
             filename=clean_filename,
             title=_clean(title) or Path(clean_filename).stem,
-            tenant_id=_clean(tenant_id),
-            owner_id=_clean(owner_id),
-            group_ids=_clean_many(group_ids),
-            principal_ids=_clean_many(principal_ids),
-            classification=_clean(classification),
+            tenant_id=clean_tenant_id,
+            owner_id=clean_owner_id,
+            group_ids=clean_group_ids,
+            principal_ids=clean_principal_ids,
+            classification=clean_classification,
             status=DocumentStatus.UPLOADED,
             content_type=content_type,
             size_bytes=size_bytes,
             content_hash=content_hash,
+            access_signature=signature,
+            dedupe_key=document_dedupe_key,
             source_path=str(source_path),
             created_at=now,
             updated_at=now,
         )
-        return self.registry.create(record)
+        return DocumentCreateResult(record=self.registry.create(record), created=True)
 
     def list_documents(self, *, include_deleted: bool = False) -> list[DocumentRecord]:
         return self.registry.list(include_deleted=include_deleted)
@@ -194,10 +320,23 @@ class DocumentService:
         raise_errors: bool = False,
     ) -> DocumentRecord:
         try:
-            record = self._require_document(document_id)
+            record = self._ensure_document_fingerprints(
+                self._require_document(document_id)
+            )
+            plan = self._plan_document_index(record)
+            if plan.action == IndexAction.SKIP:
+                record = self.registry.update_status(
+                    record.document_id,
+                    DocumentStatus.READY,
+                    error_message=None,
+                )
+                self._notify_collection_updated()
+                return record
 
             chunking_result: ChunkingResult | None = None
-            chunks_path = _existing_path(record.chunks_path)
+            chunks_path = (
+                _existing_path(record.chunks_path) if plan.reuse_chunks else None
+            )
             if chunks_path is not None:
                 chunking_result, chunks_path = self._load_chunking_result(
                     record,
@@ -205,7 +344,9 @@ class DocumentService:
                 )
             else:
                 parsed_document: ParsedDocument | None = None
-                parsed_json_path = _existing_path(record.parsed_path)
+                parsed_json_path = (
+                    _existing_path(record.parsed_path) if plan.reuse_parsed else None
+                )
                 if parsed_json_path is not None:
                     parsed_document, parsed_json_path = self._load_parsed_document(
                         record,
@@ -240,15 +381,8 @@ class DocumentService:
                 status=DocumentStatus.INDEXING,
             )
 
-            index_path = _existing_path(record.index_path)
-            if index_path is not None:
-                indexing_result, index_path = self._load_indexing_result(
-                    record,
-                    index_path,
-                )
-            else:
-                self._set_job_stage(job_id, DocumentJobStage.INDEXING, 75)
-                indexing_result, index_path = self._index_document(record, chunking_result)
+            self._set_job_stage(job_id, DocumentJobStage.INDEXING, 75)
+            indexing_result, index_path = self._index_document(record, chunking_result)
             self._raise_if_cancelled(job_id)
 
             self._set_job_stage(job_id, DocumentJobStage.REBUILDING_COLLECTION, 90)
@@ -259,7 +393,7 @@ class DocumentService:
                 status=DocumentStatus.READY,
                 error_message=None,
             )
-            self.rebuild_collection()
+            self._sync_runtime_state(record, chunking_result, indexing_result)
             self._notify_collection_updated()
             return record
         except _JobCancelled:
@@ -293,8 +427,9 @@ class DocumentService:
         existing = self._require_document(document_id)
         self._cancel_document_jobs(document_id)
         self._delete_index_records(existing)
+        self.chunk_repository.delete_by_document(document_id)
+        self.document_index_manifest_repository.mark_deleted(document_id)
         record = self.registry.update_status(document_id, DocumentStatus.DELETED)
-        self.rebuild_collection()
         self._notify_collection_updated()
         return record
 
@@ -309,19 +444,46 @@ class DocumentService:
         classification: str | None,
     ) -> DocumentRecord:
         existing = self._require_document(document_id)
+        clean_tenant_id = _clean(tenant_id)
+        clean_owner_id = _clean(owner_id)
+        clean_group_ids = _clean_many(group_ids)
+        clean_principal_ids = _clean_many(principal_ids)
+        clean_classification = _clean(classification)
+        signature = build_access_signature(
+            tenant_id=clean_tenant_id,
+            owner_id=clean_owner_id,
+            group_ids=clean_group_ids,
+            principal_ids=clean_principal_ids,
+            classification=clean_classification,
+        )
+        document_dedupe_key = build_dedupe_key(
+            content_hash=existing.content_hash,
+            access_signature_value=signature,
+        )
         record = self.registry.update_permissions(
             document_id,
-            tenant_id=_clean(tenant_id),
-            owner_id=_clean(owner_id),
-            group_ids=_clean_many(group_ids),
-            principal_ids=_clean_many(principal_ids),
-            classification=_clean(classification),
+            tenant_id=clean_tenant_id,
+            owner_id=clean_owner_id,
+            group_ids=clean_group_ids,
+            principal_ids=clean_principal_ids,
+            classification=clean_classification,
+            access_signature=signature,
+            dedupe_key=document_dedupe_key,
         )
         if existing.status == DocumentStatus.READY:
-            indexing_result = self._rewrite_access(record)
-            if indexing_result is not None:
+            rewritten = self._rewrite_access(record)
+            if rewritten is not None:
+                chunking_result, indexing_result = rewritten
+                self.chunk_repository.replace_document_chunks(
+                    record.document_id,
+                    chunking_result.chunks,
+                )
                 self._set_index_record_payloads(indexing_result)
-            self.rebuild_collection()
+                self.document_index_manifest_repository.update_access_signature(
+                    record.document_id,
+                    access_signature=signature,
+                    manifest=indexing_result.manifest,
+                )
             self._notify_collection_updated()
         return record
 
@@ -341,6 +503,7 @@ class DocumentService:
                 records,
                 fallback_embedding_model=self._configured_embedding_model(),
                 fallback_embedding_dimension=self._configured_embedding_dimension(),
+                fallback_index_version=self.settings.documents_index_version,
                 dense_vector_name=self.settings.dense_vector_name,
                 sparse_vector_name=self.settings.sparse_vector_name,
                 sparse_top_n=self.settings.sparse_top_n,
@@ -351,6 +514,11 @@ class DocumentService:
             index_path.parent.mkdir(parents=True, exist_ok=True)
             chunks_path.write_text(collection_chunks.to_json(), encoding="utf-8")
             index_path.write_text(collection_index.to_json(), encoding="utf-8")
+            self.chunk_repository.replace_all(collection_chunks.chunks)
+            self.manifest_repository.save(
+                self.settings.qdrant_collection,
+                collection_index.manifest,
+            )
 
     def _parse_document(self, record: DocumentRecord) -> tuple[ParsedDocument, Path]:
         pipeline = LocalParsingPipeline(
@@ -451,11 +619,18 @@ class DocumentService:
                     dense_vector_name=self.settings.dense_vector_name,
                     sparse_vector_name=self.settings.sparse_vector_name,
                     sparse_top_n=self.settings.sparse_top_n,
+                    index_version=self.settings.documents_index_version,
                     force_reindex=True,
                 ),
             )
             indexing_result = indexer.index(chunking_result)
             _enrich_index_records(indexing_result, record)
+            self._annotate_index_manifest(
+                record,
+                indexing_result.manifest,
+                embedding_model=embedding_provider.model_name,
+                embedding_dimension=embedding_provider.dimension,
+            )
             index_dir = self._document_dir(record.document_id) / "index"
             index_dir.mkdir(parents=True, exist_ok=True)
             index_path = index_dir / f"{Path(record.filename).stem}.index.json"
@@ -510,6 +685,192 @@ class DocumentService:
     def _configured_embedding_dimension(self) -> int:
         return BGEM3EmbeddingProvider.dimension
 
+    def _current_embedding_config(self) -> tuple[str, int]:
+        if self.settings.bge_model:
+            return self.settings.bge_model, self._configured_embedding_dimension()
+        manifest = self.manifest_repository.get(self.settings.qdrant_collection)
+        if manifest is not None:
+            return manifest.embedding_model, manifest.embedding_dimension
+        return self._configured_embedding_model(), self._configured_embedding_dimension()
+
+    def _index_signatures(
+        self,
+        record: DocumentRecord,
+        *,
+        embedding_model: str | None = None,
+        embedding_dimension: int | None = None,
+    ) -> IndexSignatures:
+        resolved_embedding_model, resolved_embedding_dimension = (
+            (embedding_model, embedding_dimension)
+            if embedding_model is not None and embedding_dimension is not None
+            else self._current_embedding_config()
+        )
+        signature = record.access_signature or _access_signature_from_record(record)
+        return IndexSignatures(
+            parser_config_signature=parser_config_signature(self.settings),
+            chunk_config_signature=chunk_config_signature(self.settings),
+            embedding_config_signature=embedding_config_signature(
+                settings=self.settings,
+                embedding_model=resolved_embedding_model,
+                embedding_dimension=resolved_embedding_dimension,
+            ),
+            access_signature=signature,
+            embedding_model=resolved_embedding_model,
+            embedding_dimension=resolved_embedding_dimension,
+        )
+
+    def _ensure_document_fingerprints(self, record: DocumentRecord) -> DocumentRecord:
+        signature = _access_signature_from_record(record)
+        document_dedupe_key = build_dedupe_key(
+            content_hash=record.content_hash,
+            access_signature_value=signature,
+        )
+        if (
+            record.access_signature == signature
+            and record.dedupe_key == document_dedupe_key
+        ):
+            return record
+        return self.registry.update(
+            record.document_id,
+            access_signature=signature,
+            dedupe_key=document_dedupe_key,
+        )
+
+    def _find_legacy_duplicate(
+        self,
+        *,
+        content_hash: str,
+        access_signature: str,
+        dedupe_key: str,
+    ) -> DocumentRecord | None:
+        for candidate in self.registry.find_by_content_hash(content_hash):
+            if _access_signature_from_record(candidate) != access_signature:
+                continue
+            if (
+                candidate.access_signature != access_signature
+                or candidate.dedupe_key != dedupe_key
+            ):
+                return self.registry.update(
+                    candidate.document_id,
+                    access_signature=access_signature,
+                    dedupe_key=dedupe_key,
+                )
+            return candidate
+        return None
+
+    def _plan_document_index(self, record: DocumentRecord) -> IndexPlan:
+        signatures = self._index_signatures(record)
+        manifest = self.document_index_manifest_repository.get(record.document_id)
+        if manifest is None or not manifest.active:
+            return IndexPlan(action=IndexAction.REINDEX, signatures=signatures)
+
+        content_matches = manifest.content_hash == record.content_hash
+        parser_matches = (
+            manifest.parser_config_signature
+            == signatures.parser_config_signature
+        )
+        chunk_matches = (
+            manifest.chunk_config_signature == signatures.chunk_config_signature
+        )
+        embedding_matches = (
+            manifest.embedding_config_signature
+            == signatures.embedding_config_signature
+        )
+        access_matches = manifest.access_signature == signatures.access_signature
+        index_version_matches = (
+            manifest.index_version == self.settings.documents_index_version
+        )
+        chunk_rows_ready = (
+            self.chunk_repository.count_by_document(record.document_id) > 0
+        )
+        can_skip = (
+            record.status == DocumentStatus.READY
+            and record.indexed_count > 0
+            and chunk_rows_ready
+            and content_matches
+            and parser_matches
+            and chunk_matches
+            and embedding_matches
+            and access_matches
+            and index_version_matches
+        )
+        if can_skip:
+            return IndexPlan(action=IndexAction.SKIP, signatures=signatures)
+
+        return IndexPlan(
+            action=IndexAction.REINDEX,
+            signatures=signatures,
+            reuse_parsed=content_matches and parser_matches,
+            reuse_chunks=content_matches and parser_matches and chunk_matches,
+        )
+
+    def _annotate_index_manifest(
+        self,
+        record: DocumentRecord,
+        manifest: IndexManifest,
+        *,
+        embedding_model: str,
+        embedding_dimension: int,
+    ) -> None:
+        signatures = self._index_signatures(
+            record,
+            embedding_model=embedding_model,
+            embedding_dimension=embedding_dimension,
+        )
+        manifest.metadata.update(
+            {
+                "content_hash": record.content_hash,
+                "access_signature": signatures.access_signature,
+                "parser_config_signature": signatures.parser_config_signature,
+                "chunk_config_signature": signatures.chunk_config_signature,
+                "embedding_config_signature": signatures.embedding_config_signature,
+                "documents_index_version": self.settings.documents_index_version,
+            }
+        )
+
+    def _sync_runtime_state(
+        self,
+        record: DocumentRecord,
+        chunking_result: ChunkingResult,
+        indexing_result: IndexingResult,
+    ) -> None:
+        self.chunk_repository.replace_document_chunks(
+            record.document_id,
+            chunking_result.chunks,
+        )
+        self.manifest_repository.save(
+            self.settings.qdrant_collection,
+            indexing_result.manifest,
+        )
+        signatures = self._index_signatures(
+            record,
+            embedding_model=indexing_result.manifest.embedding_model,
+            embedding_dimension=indexing_result.manifest.embedding_dimension,
+        )
+        self.document_index_manifest_repository.save(
+            manifest=indexing_result.manifest,
+            content_hash=record.content_hash,
+            parser_config_signature=signatures.parser_config_signature,
+            chunk_config_signature=signatures.chunk_config_signature,
+            embedding_config_signature=signatures.embedding_config_signature,
+            access_signature=signatures.access_signature,
+            chunk_count=len(chunking_result.chunks),
+            indexed_count=indexing_result.indexed_count,
+        )
+
+    def _legacy_collection_manifest(self) -> IndexManifest | None:
+        path = self.settings.documents_collection_index_path
+        if not path.exists():
+            path = self.settings.index_path
+        if not path.exists():
+            return None
+        try:
+            return IndexingResult.model_validate_json(
+                path.read_text(encoding="utf-8")
+            ).manifest
+        except Exception:
+            return None
+
     def _delete_index_records(self, record: DocumentRecord) -> int:
         if not _may_have_index_records(record):
             return 0
@@ -556,7 +917,10 @@ class DocumentService:
             if callable(close):
                 close()
 
-    def _rewrite_access(self, record: DocumentRecord) -> IndexingResult | None:
+    def _rewrite_access(
+        self,
+        record: DocumentRecord,
+    ) -> tuple[ChunkingResult, IndexingResult] | None:
         if not record.chunks_path or not record.index_path:
             return None
         chunks_path = Path(record.chunks_path)
@@ -577,8 +941,11 @@ class DocumentService:
         indexing_result.manifest.metadata["permissions_updated_at"] = (
             datetime.now(timezone.utc).isoformat()
         )
+        indexing_result.manifest.metadata["access_signature"] = (
+            _access_signature_from_record(record)
+        )
         index_path.write_text(indexing_result.to_json(), encoding="utf-8")
-        return indexing_result
+        return chunking_result, indexing_result
 
     def _document_dir(self, document_id: str) -> Path:
         return self.settings.documents_storage_dir / document_id
@@ -645,6 +1012,7 @@ def _combine_indexes(
     *,
     fallback_embedding_model: str,
     fallback_embedding_dimension: int,
+    fallback_index_version: str,
     dense_vector_name: str,
     sparse_vector_name: str,
     sparse_top_n: int | None,
@@ -658,6 +1026,7 @@ def _combine_indexes(
         return _empty_indexing_result(
             embedding_model=fallback_embedding_model,
             embedding_dimension=fallback_embedding_dimension,
+            index_version=fallback_index_version,
             dense_vector_name=dense_vector_name,
             sparse_vector_name=sparse_vector_name,
             sparse_top_n=sparse_top_n,
@@ -715,6 +1084,7 @@ def _empty_indexing_result(
     *,
     embedding_model: str,
     embedding_dimension: int,
+    index_version: str,
     dense_vector_name: str,
     sparse_vector_name: str,
     sparse_top_n: int | None,
@@ -726,7 +1096,7 @@ def _empty_indexing_result(
         chunk_hashes={},
         embedding_model=embedding_model,
         embedding_dimension=embedding_dimension,
-        index_version="idx-v1",
+        index_version=index_version,
         backend=IndexBackend.QDRANT_HYBRID,
         status=IndexingStatus.INDEXED,
         metadata={
@@ -834,6 +1204,16 @@ def _access_from_record(record: DocumentRecord) -> AccessControl:
     )
 
 
+def _access_signature_from_record(record: DocumentRecord) -> str:
+    return build_access_signature(
+        tenant_id=record.tenant_id,
+        owner_id=record.owner_id,
+        group_ids=record.group_ids,
+        principal_ids=record.principal_ids,
+        classification=record.classification,
+    )
+
+
 def _write_and_hash(file: BinaryIO, target_path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
@@ -878,6 +1258,16 @@ def _existing_path(value: str | Path | None) -> Path | None:
         return None
     path = Path(value)
     return path if path.exists() else None
+
+
+def _cleanup_document_dir(document_dir: Path, storage_dir: Path) -> None:
+    try:
+        resolved_document_dir = document_dir.resolve()
+        resolved_storage_dir = storage_dir.resolve()
+        resolved_document_dir.relative_to(resolved_storage_dir)
+    except (OSError, ValueError):
+        return
+    shutil.rmtree(resolved_document_dir, ignore_errors=True)
 
 
 def _safe_filename(value: str) -> str:

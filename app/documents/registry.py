@@ -33,6 +33,8 @@ class DocumentRegistry:
                     content_type TEXT,
                     size_bytes INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
+                    access_signature TEXT,
+                    dedupe_key TEXT,
                     source_path TEXT NOT NULL,
                     parsed_path TEXT,
                     chunks_path TEXT,
@@ -45,6 +47,20 @@ class DocumentRegistry:
                 )
                 """
             )
+            _ensure_column(connection, "documents", "access_signature", "TEXT")
+            _ensure_column(connection, "documents", "dedupe_key", "TEXT")
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_documents_dedupe_key
+                ON documents(dedupe_key, status)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_documents_content_hash
+                ON documents(tenant_id, content_hash, status)
+                """
+            )
 
     def create(self, record: DocumentRecord) -> DocumentRecord:
         with self._connection() as connection:
@@ -53,20 +69,57 @@ class DocumentRegistry:
                 INSERT INTO documents (
                     document_id, filename, title, tenant_id, owner_id, group_ids,
                     principal_ids, classification, status, content_type, size_bytes,
-                    content_hash, source_path, parsed_path, chunks_path, index_path,
-                    error_message, chunk_count, indexed_count, created_at, updated_at
+                    content_hash, access_signature, dedupe_key, source_path,
+                    parsed_path, chunks_path, index_path, error_message, chunk_count,
+                    indexed_count, created_at, updated_at
                 )
                 VALUES (
                     :document_id, :filename, :title, :tenant_id, :owner_id,
                     :group_ids, :principal_ids, :classification, :status,
-                    :content_type, :size_bytes, :content_hash, :source_path,
-                    :parsed_path, :chunks_path, :index_path, :error_message,
-                    :chunk_count, :indexed_count, :created_at, :updated_at
+                    :content_type, :size_bytes, :content_hash, :access_signature,
+                    :dedupe_key, :source_path, :parsed_path, :chunks_path,
+                    :index_path, :error_message, :chunk_count, :indexed_count,
+                    :created_at, :updated_at
                 )
                 """,
                 _record_to_row(record),
             )
         return record
+
+    def find_by_dedupe_key(self, dedupe_key: str) -> DocumentRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM documents
+                WHERE dedupe_key = ?
+                  AND status NOT IN (?, ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (
+                    dedupe_key,
+                    DocumentStatus.DELETED.value,
+                    DocumentStatus.FAILED.value,
+                ),
+            ).fetchone()
+        return _row_to_record(row) if row is not None else None
+
+    def find_by_content_hash(self, content_hash: str) -> list[DocumentRecord]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM documents
+                WHERE content_hash = ?
+                  AND status NOT IN (?, ?)
+                ORDER BY created_at ASC
+                """,
+                (
+                    content_hash,
+                    DocumentStatus.DELETED.value,
+                    DocumentStatus.FAILED.value,
+                ),
+            ).fetchall()
+        return [_row_to_record(row) for row in rows]
 
     def get(self, document_id: str) -> DocumentRecord | None:
         with self._connection() as connection:
@@ -136,6 +189,8 @@ class DocumentRegistry:
         group_ids: list[str],
         principal_ids: list[str],
         classification: str | None,
+        access_signature: str | None = None,
+        dedupe_key: str | None = None,
     ) -> DocumentRecord:
         return self.update(
             document_id,
@@ -144,6 +199,8 @@ class DocumentRegistry:
             group_ids=json.dumps(group_ids, ensure_ascii=False),
             principal_ids=json.dumps(principal_ids, ensure_ascii=False),
             classification=classification,
+            access_signature=access_signature,
+            dedupe_key=dedupe_key,
         )
 
     def update(self, document_id: str, **values: object) -> DocumentRecord:
@@ -214,3 +271,19 @@ def _json_list(value: object) -> list[str]:
     if not isinstance(decoded, list):
         return []
     return [str(item) for item in decoded if str(item).strip()]
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in columns:
+        connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+        )

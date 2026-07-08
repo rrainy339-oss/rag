@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -45,9 +44,7 @@ settings = APISettings.from_env()
 security_settings = SecuritySettings.from_env()
 audit_logger = AuditLogger.from_settings(security_settings)
 _runtime: RAGRuntime | None = None
-_runtime_collection_signature: (
-    tuple[tuple[int, int] | None, tuple[int, int] | None] | None
-) = None
+_runtime_collection_signature: tuple[object, ...] | None = None
 _document_service: DocumentService | None = None
 _auth_service: AuthService | None = None
 
@@ -72,8 +69,9 @@ async def lifespan(_: FastAPI):
 def get_runtime() -> RAGRuntime:
     global _runtime, _runtime_collection_signature
     try:
-        get_document_service().ensure_collection_files()
-        current_signature = _collection_signature()
+        service = get_document_service()
+        service.ensure_collection_files()
+        current_signature = service.collection_manifest_signature()
         if (
             _runtime is not None
             and _runtime_collection_signature != current_signature
@@ -81,27 +79,12 @@ def get_runtime() -> RAGRuntime:
             close_runtime()
         if _runtime is None:
             _runtime = RAGRuntime(settings)
-            _runtime_collection_signature = _collection_signature()
+            _runtime_collection_signature = service.collection_manifest_signature()
         return _runtime
     except RuntimeConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-def _collection_signature() -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
-    return (
-        _file_signature(settings.index_path),
-        _file_signature(settings.chunks_path),
-    )
-
-
-def _file_signature(path: Path) -> tuple[int, int] | None:
-    try:
-        stat = Path(path).stat()
-    except OSError:
-        return None
-    return (stat.st_mtime_ns, stat.st_size)
 
 
 def get_document_service() -> DocumentService:
@@ -360,7 +343,7 @@ def upload_document(
             if principal.enforce_permissions
             else None
         )
-        record = service.create_document(
+        create_result = service.create_document_result(
             filename=file.filename or "document",
             content_type=file.content_type,
             file=file.file,
@@ -371,7 +354,12 @@ def upload_document(
             principal_ids=_split_form_values(principal_ids),
             classification=classification,
         )
-        job = service.enqueue_document(record.document_id)
+        record = create_result.record
+        job = (
+            service.enqueue_document(record.document_id)
+            if create_result.created
+            else service.latest_job(record.document_id)
+        )
         audit_logger.log(
             event_type="document_upload",
             request_id=request.state.request_id,
@@ -379,10 +367,11 @@ def upload_document(
             metadata={
                 "document_id": record.document_id,
                 "filename": record.filename,
+                "created": create_result.created,
                 "tenant_id": record.tenant_id,
                 "group_ids": record.group_ids,
                 "classification": record.classification,
-                "job_id": job.job_id,
+                "job_id": job.job_id if job is not None else None,
             },
         )
         return _to_document_response(record, request_id=request.state.request_id, job=job)
